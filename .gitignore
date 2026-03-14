@@ -1,0 +1,73 @@
+# ===========================
+# Python / Dataloom Engine
+# ===========================
+dataloom-engine/venv/
+dataloom-engine/__pycache__/
+dataloom-engine/*.pyc
+dataloom-engine/*.pyo
+dataloom-engine/.env
+*.egg-info/
+dist/
+build/
+
+# ===========================
+# React Native / Node
+# ===========================
+project/node_modules/
+project/.bundle/
+project/npm-debug.log
+project/yarn-error.log
+project/yarn-debug.log
+
+# Android
+project/android/.gradle/
+project/android/app/build/
+project/android/build/
+project/android/local.properties
+project/android/captures/
+project/android/.externalNativeBuild/
+project/android/.cxx/
+
+# iOS
+project/ios/Pods/
+project/ios/build/
+project/ios/*.xcworkspace
+project/ios/DerivedData/
+project/ios/.xcode.env.local
+
+# ===========================
+# Supabase
+# ===========================
+supabase/.temp/
+supabase/functions/.env
+
+# ===========================
+# Environment Variables
+# ===========================
+.env
+.env.local
+.env.development
+.env.production
+*.env
+
+# ===========================
+# Editor / OS
+# ===========================
+.DS_Store
+.vscode/settings.json
+.idea/
+Thumbs.db
+*.log
+
+# ===========================
+# Misc
+# ===========================
+.expo/
+.expo-shared/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+web-build/
