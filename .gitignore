@@ -27,6 +27,7 @@ project/android/local.properties
 project/android/captures/
 project/android/.externalNativeBuild/
 project/android/.cxx/
+*.keystore
 
 # iOS
 project/ios/Pods/
