@@ -2,7 +2,7 @@
 import React, { useState, useEffect } from "react";
 import { 
   View, FlatList, Text, TouchableOpacity, Linking, 
-  ActivityIndicator, Alert, ScrollView, StyleSheet 
+  ActivityIndicator, Alert, ScrollView, StyleSheet, Modal
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import CryptoJS from "crypto-js";
@@ -21,7 +21,7 @@ const stripHtml = (str) => {
 
 // ✅ ArticleCard OUTSIDE WelcomeScreen — hooks allowed here
 const ArticleCard = ({ item, hasLoggedIn, thumbsState, setThumbsState, 
-                       viewedArticles, verificationResults }) => {
+                       viewedArticles, verificationResults, setWhyModal }) => {
   const viewStartRef = React.useRef(null);
 
   const normalizeUrl = (u) => {
@@ -72,6 +72,19 @@ const ArticleCard = ({ item, hasLoggedIn, thumbsState, setThumbsState,
         trackInteraction({ article: item, interaction_type: "click" });
         Linking.openURL(openUrl).catch(() => Alert.alert("Error", `Cannot open this link:\n${openUrl}`));
       }}
+      onLongPress={() => {
+        if (item.personalization_score !== undefined) {
+          setWhyModal({
+            title: item.title,
+            score: item.personalization_score,
+            why: item.why_recommended || "Trending news in your region",
+            breakdown: item.score_breakdown || null,
+          });
+        } else {
+          Alert.alert("ℹ️ Not personalized yet", "Search more and rate articles to get personalized recommendations.");
+        }
+      }}
+      delayLongPress={400}
       onPressIn={handleViewStart}
       onPressOut={handleViewEnd}
       style={styles.articleCard}
@@ -162,6 +175,7 @@ export default function WelcomeScreen({ navigation, route }) {
   const [verificationResults, setVerificationResults] = useState({});
   const [thumbsState, setThumbsState] = useState({});
   const [hasSearched, setHasSearched] = useState(false);
+  const [whyModal, setWhyModal] = useState(null);
 
   const viewabilityConfig = React.useRef({
     itemVisiblePercentThreshold: 50,
@@ -243,6 +257,7 @@ export default function WelcomeScreen({ navigation, route }) {
       setVerificationResults({});
       setHasSearched(false);
       setThumbsState({});
+      setWhyModal(null);
       Alert.alert("Logged out", "You've been signed out successfully.");
       navigation.navigate("Welcome");
     } catch (e) {
@@ -270,7 +285,6 @@ export default function WelcomeScreen({ navigation, route }) {
     );
   };
 
-  // ✅ Simple wrapper — passes all needed props to ArticleCard
   const renderArticle = ({ item }) => (
     <ArticleCard
       item={item}
@@ -279,6 +293,7 @@ export default function WelcomeScreen({ navigation, route }) {
       setThumbsState={setThumbsState}
       viewedArticles={viewedArticles}
       verificationResults={verificationResults}
+      setWhyModal={setWhyModal}
     />
   );
 
@@ -405,6 +420,74 @@ export default function WelcomeScreen({ navigation, route }) {
           </View>
         )}
       </View>
+
+      {/* WHY THIS NEWS MODAL */}
+      <Modal
+        visible={!!whyModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setWhyModal(null)}
+      >
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
+          onPress={() => setWhyModal(null)}
+        >
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>🤖 Why this news?</Text>
+            <Text style={styles.modalArticleTitle} numberOfLines={2}>
+              {whyModal?.title}
+            </Text>
+
+            {/* Score bar */}
+            <View style={styles.scoreRow}>
+              <Text style={styles.scoreLabel}>Personalization match</Text>
+              <Text style={styles.scoreValue}>
+                {Math.round((whyModal?.score ?? 0) * 100)}%
+              </Text>
+            </View>
+            <View style={styles.scoreBarBg}>
+              <View style={[styles.scoreBarFill, { width: `${Math.round((whyModal?.score ?? 0) * 100)}%` }]} />
+            </View>
+
+            {/* Explanation */}
+            <Text style={styles.whyText}>{whyModal?.why}</Text>
+
+            {/* Breakdown */}
+            {whyModal?.breakdown && (
+              <View style={styles.breakdownBox}>
+                {whyModal.breakdown.query_relevance !== undefined && (
+                  <Text style={styles.breakdownItem}>
+                    🔍 Query relevance: {Math.round(whyModal.breakdown.query_relevance * 100)}%
+                  </Text>
+                )}
+                {whyModal.breakdown.topic_preference !== undefined && (
+                  <Text style={styles.breakdownItem}>
+                    📌 Topic match: {Math.round(whyModal.breakdown.topic_preference * 100)}%
+                  </Text>
+                )}
+                {whyModal.breakdown.source_preference !== undefined && (
+                  <Text style={styles.breakdownItem}>
+                    📰 Source trust: {Math.round(whyModal.breakdown.source_preference * 100)}%
+                  </Text>
+                )}
+                {whyModal.breakdown.freshness_bonus !== undefined && (
+                  <Text style={styles.breakdownItem}>
+                    ⚡ Freshness bonus: +{Math.round(whyModal.breakdown.freshness_bonus * 100)}%
+                  </Text>
+                )}
+              </View>
+            )}
+
+            <TouchableOpacity
+              style={styles.modalClose}
+              onPress={() => setWhyModal(null)}
+            >
+              <Text style={styles.modalCloseText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 }
@@ -446,4 +529,31 @@ const styles = StyleSheet.create({
   retryButtonText: { color: "#FFFFFF", fontSize: 16, fontWeight: "600" },
   thumbButton: { padding: 4, borderRadius: 6, backgroundColor: "#f1f5f9" },
   thumbButtonActive: { backgroundColor: "#dbeafe" },
+
+  // Modal styles
+  modalOverlay: {
+    flex: 1, backgroundColor: "rgba(0,0,0,0.5)",
+    justifyContent: "center", alignItems: "center",
+  },
+  modalCard: {
+    backgroundColor: "#fff", borderRadius: 16,
+    padding: 20, marginHorizontal: 24, width: "90%",
+    shadowColor: "#000", shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15, shadowRadius: 12, elevation: 8,
+  },
+  modalTitle: { fontSize: 18, fontWeight: "700", marginBottom: 8, color: "#1a1a1a" },
+  modalArticleTitle: { fontSize: 14, color: "#475569", marginBottom: 16, lineHeight: 20 },
+  scoreRow: { flexDirection: "row", justifyContent: "space-between", marginBottom: 6 },
+  scoreLabel: { fontSize: 13, color: "#64748b" },
+  scoreValue: { fontSize: 13, fontWeight: "700", color: "#2874F0" },
+  scoreBarBg: {
+    height: 8, backgroundColor: "#e2e8f0",
+    borderRadius: 4, marginBottom: 16, overflow: "hidden",
+  },
+  scoreBarFill: { height: 8, backgroundColor: "#2874F0", borderRadius: 4 },
+  whyText: { fontSize: 14, color: "#334155", lineHeight: 20, marginBottom: 12 },
+  breakdownBox: { backgroundColor: "#f8fafc", borderRadius: 8, padding: 12, marginBottom: 16 },
+  breakdownItem: { fontSize: 12, color: "#64748b", marginBottom: 4 },
+  modalClose: { backgroundColor: "#2874F0", borderRadius: 8, paddingVertical: 10, alignItems: "center" },
+  modalCloseText: { color: "#fff", fontWeight: "600", fontSize: 15 },
 });
