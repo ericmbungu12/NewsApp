@@ -1,36 +1,31 @@
 // supabase/functions/fetch-news/index.ts
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { CONTRACT_ADDRESS, BLOCKCHAIN_RPC, checkBatchOnChain, registerBatchOnChain, getNetworkType, hashArticle } from "./blockchain.ts";
-import { normalizeRegion, detectRegionFromQuery, getRegionKey } from "./region.ts";
-import { CACHE_DURATION_MS, normalizeForDisplay, normalizeForSearch, expandQueryForCoverage, detectIntent, detectEntityType, fetchAllSources, synthesizeWithGuaranteedCoverage, upsertDigestToSupabase, insertArticlesToSupabase, generateTier12Placeholder } from "./news_tier.ts";
+import { CONTRACT_ADDRESS, checkBatchOnChain, registerBatchOnChain, getNetworkType, hashArticle } from "./blockchain.ts";
+import { normalizeRegion, getRegionKey } from "./region.ts";
+import { CACHE_DURATION_MS, normalizeForDisplay, normalizeForSearch, expandQueryForCoverage, detectIntent, detectEntityType, fetchAllSources, synthesizeWithGuaranteedCoverage, upsertDigestToSupabase, insertArticlesToSupabase } from "./news_tier.ts";
 
+// ── In-memory cache + anon rate limit ────────────────────────────────────────
 const cache    = new Map<string,{expiry:number;data:unknown}>();
 const anonHits = new Map<string,number>();
-
-const getIP    = (req:Request) => req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()??req.headers.get("x-real-ip")??"unknown";
-const cached   = (k:string) => {const e=cache.get(k);return e&&e.expiry>Date.now()?e.data:null;};
-const setCache = (k:string,d:unknown) => cache.set(k,{expiry:Date.now()+CACHE_DURATION_MS,data:d});
-const freshLabel=(iso:string)=>{const ms=Date.now()-new Date(iso||0).getTime();return ms<3.6e6?"breaking":ms<864e5?"today":ms<6048e5?"this_week":"older";};
-const NO_BV   =(extra={})=>({status:"not_registered",registered:false,verified:false,publisher:null,registered_at:null,contract_address:CONTRACT_ADDRESS??null,tx_hash:null,badge:"❌ Unverified",...extra});
-
-const sbPatch=async(url:string,key:string,path:string,body:unknown,label="Update")=>{
-  try{
-    const r=await fetch(`${url}/rest/v1/${path}`,{method:"PATCH",headers:{apikey:key,Authorization:`Bearer ${key}`,"Content-Type":"application/json"},body:JSON.stringify(body)});
-    if(!r.ok){console.error(`❌ ${label}: ${r.status} - ${await r.text()}`);return{success:false};}
-    console.log(`✅ ${label}`);return{success:true};
-  }catch(e:any){console.error(`❌ ${label}: ${e.message}`);return{success:false,error:e.message};}
+const getIP    = (req:Request)=>req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()??req.headers.get("x-real-ip")??"unknown";
+const cached   = (k:string)=>{const e=cache.get(k);return e&&e.expiry>Date.now()?e.data:null;};
+const setCache = (k:string,d:unknown)=>cache.set(k,{expiry:Date.now()+CACHE_DURATION_MS,data:d});
+const freshLbl = (iso:string)=>{const ms=Date.now()-new Date(iso||0).getTime();return ms<3.6e6?"breaking":ms<864e5?"today":ms<6048e5?"this_week":"older";};
+const NO_BV    = (x={})=>({status:"not_registered",registered:false,verified:false,publisher:null,registered_at:null,contract_address:CONTRACT_ADDRESS??null,tx_hash:null,badge:"❌ Unverified",...x});
+const sbPatch  = async(url:string,key:string,path:string,body:unknown,label="Update")=>{
+  try{const r=await fetch(`${url}/rest/v1/${path}`,{method:"PATCH",headers:{apikey:key,Authorization:`Bearer ${key}`,"Content-Type":"application/json"},body:JSON.stringify(body)});if(!r.ok){console.error(`❌ ${label}: ${r.status}`);return{success:false};}console.log(`✅ ${label}`);return{success:true};}
+  catch(e:any){console.error(`❌ ${label}: ${e.message}`);return{success:false};}
 };
 
 // ── RL Engine ─────────────────────────────────────────────────────────────────
-async function rankWithRL(articles:any[],query:string,userTwin:any|null):Promise<any[]> {
+async function rankWithRL(articles:any[],query:string,twin:any|null):Promise<any[]>{
   try{
     const r=await fetch("https://newsapp-63t4.onrender.com/rank",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
+      method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
         articles:articles.map(a=>({url:a.url,title:a.title,description:a.description||"",source:a.source||"",topic:a.cluster_tag||"",cluster_tag:a.cluster_tag||"",published_at:a.published_at||"",freshness_label:a.freshness_label||""})),
-        twin:userTwin?{topic_preferences:userTwin.topic_preferences||{},source_preferences:userTwin.source_preferences||{},total_clicks:userTwin.total_clicks||0,total_views:userTwin.total_views||0,total_skips:userTwin.total_skips||0,total_thumbs_up:userTwin.total_thumbs_up||0,total_thumbs_down:userTwin.total_thumbs_down||0,avg_view_time:userTwin.avg_view_time||0.0}:null,
+        twin:twin?{topic_preferences:twin.topic_preferences||{},source_preferences:twin.source_preferences||{},total_clicks:twin.total_clicks||0,total_views:twin.total_views||0,total_skips:twin.total_skips||0,total_thumbs_up:twin.total_thumbs_up||0,total_thumbs_down:twin.total_thumbs_down||0,avg_view_time:twin.avg_view_time||0.0}:null,
         query,
       }),
       signal:AbortSignal.timeout(8000),
@@ -42,6 +37,7 @@ async function rankWithRL(articles:any[],query:string,userTwin:any|null):Promise
   }catch(e:any){console.warn("RL unavailable:",e.message);return articles;}
 }
 
+// ── Main handler ──────────────────────────────────────────────────────────────
 serve(async(req:Request)=>{
   const ENV={
     gnews:      Deno.env.get("GNEWS_API_KEY"),
@@ -56,49 +52,52 @@ serve(async(req:Request)=>{
   if(!ENV.sbUrl||!ENV.sbKey)return new Response(JSON.stringify({error:"Missing Supabase env"}),{status:500});
 
   try{
-    // ── Auth ─────────────────────────────────────────────────────────────
+    // ── Auth + rate limit ─────────────────────────────────────────────────
     const ip=getIP(req);
     const authHeader=req.headers.get("Authorization");
-    const isLoggedIn=authHeader?.match(/^Bearer .{33,}/);
+    const isLoggedIn=!!authHeader?.match(/^Bearer .{33,}/);
     if(!isLoggedIn){
       if((anonHits.get(ip)??0)>=1)return new Response(JSON.stringify({error:"Login required",success:false,articles:[]}),{status:402});
       anonHits.set(ip,(anonHits.get(ip)??0)+1);
       setTimeout(()=>{if((anonHits.get(ip)??0)<=1)anonHits.delete(ip);},36e5);
     }
 
-    // ── Digital twin ─────────────────────────────────────────────────────
+    // ── Load digital twin ─────────────────────────────────────────────────
     let userTwin=null;
     if(isLoggedIn&&authHeader){
       try{
         const uc=createClient(ENV.sbUrl,ENV.sbAnon,{global:{headers:{Authorization:authHeader}}});
         const{data:{user}}=await uc.auth.getUser();
-        if(user){const{data:twin}=await uc.from("digital_twins").select("*").eq("user_id",user.id).single();if(twin){userTwin=twin;console.log(`🧠 Twin: ${user.id}`);}}
-      }catch(e:any){console.warn("Twin fetch failed:",e.message);}
+        if(user){
+          const{data:twin}=await uc.from("digital_twins").select("*").eq("user_id",user.id).single();
+          if(twin){userTwin=twin;console.log(`🧠 Twin: ${user.id}`);}
+        }
+      }catch(e:any){console.warn("Twin failed:",e.message);}
     }
 
     // ── Parse request ─────────────────────────────────────────────────────
-    const{topic="latest news",region="india"}=await req.json();
-    const rawTopic=topic.toString().trim();
-    const regionKey=getRegionKey(normalizeRegion(region.toString()));
+    const{topic="latest news",region="global"}=await req.json();
+    const rawTopic    =topic.toString().trim();
+    const regionKey   =getRegionKey(normalizeRegion(region.toString()));
     const displayTopic=normalizeForDisplay(rawTopic);
-    const searchQuery=normalizeForSearch(rawTopic);
-    const intent=detectIntent(rawTopic);
-    const entityType=detectEntityType(rawTopic,rawTopic);
-    const queries=expandQueryForCoverage(rawTopic,regionKey,entityType);
+    const searchQuery =normalizeForSearch(rawTopic);
+    const intent      =detectIntent(rawTopic);
+    const entityType  =detectEntityType(rawTopic,rawTopic);
+    const queries     =expandQueryForCoverage(rawTopic,regionKey,entityType);
     console.log(`🔍 "${rawTopic}" | region=${regionKey} | intent=${intent} | entity=${entityType}`);
 
-    // ── Check cache ───────────────────────────────────────────────────────
+    // ── Cache check ───────────────────────────────────────────────────────
     const cacheKey=`digest_${displayTopic}_${regionKey}`;
-    const hit=cached(cacheKey);
-    if(hit)console.log(`⚡ Cache hit: ${cacheKey}`);
+    if(cached(cacheKey))console.log(`⚡ Cache hit: ${cacheKey}`);
 
-    // ── Fetch ALL sources (tiers 1-11 in parallel) ────────────────────────
+    // ── Fetch ALL sources (all tiers in parallel) ─────────────────────────
     const{articles:allArticles,wiki,wikidata,sourceCounts}=await fetchAllSources(
       searchQuery,regionKey,queries,
       {gnewsKey:ENV.gnews??undefined,newsapiKey:ENV.newsapi??undefined,currentsKey:ENV.currents??undefined,thenewsapiKey:ENV.thenewsapi??undefined,youtubeKey:ENV.youtube??undefined}
     );
+    console.log(`📊`,sourceCounts,`total:${allArticles.length}`);
 
-    // ── Synthesise ────────────────────────────────────────────────────────
+    // ── Synthesise — returns ONLY real articles, never fake ───────────────
     const{digest_summary,digest_source_urls,digest_reliability,articles:finalArticles,coverage_tier}=
       synthesizeWithGuaranteedCoverage(allArticles,wiki,displayTopic,entityType);
 
@@ -106,89 +105,101 @@ serve(async(req:Request)=>{
     upsertDigestToSupabase(ENV.sbUrl,ENV.sbKey,rawTopic,regionKey,digest_summary,digest_reliability,digest_source_urls).catch(()=>{});
     await insertArticlesToSupabase(ENV.sbUrl,ENV.sbKey,finalArticles,rawTopic,regionKey,CONTRACT_ADDRESS??null);
 
-    // ── Batch blockchain registration — top 10 RL-ranked articles ─────────
-    // Step 1: RL rank FIRST so we register the BEST articles
+    // ── RL rank FIRST — best articles get blockchain priority ─────────────
     const preRanked=await rankWithRL(
-      finalArticles.map(a=>({...a,source:a.source?.name??a.source??"Unknown",freshness_label:freshLabel(a.publishedAt),cluster_tag:a.tier??"general"})),
+      finalArticles.map(a=>({...a,source:a.source?.name??a.source??"Unknown",freshness_label:freshLbl(a.publishedAt),cluster_tag:a.tier??"general"})),
       displayTopic,userTwin
     );
 
-    // Step 2: Register ALL articles on-chain — no cap, minimum 10
+    // ── Register ALL articles on blockchain ───────────────────────────────
     const toRegister=preRanked.filter(a=>a.description?.trim()).map(a=>({content:a.description,url:a.url}));
-    console.log(`🔗 Registering ALL ${toRegister.length} articles on-chain...`);
+    console.log(`🔗 Registering ${toRegister.length} articles on-chain...`);
     const batchResults=await registerBatchOnChain(toRegister,300);
     const txMap=new Map(batchResults.map(r=>[r.url,r]));
 
-    // Step 3: Update Supabase with tx_hashes from batch
+    // Persist tx_hashes to Supabase
     await Promise.all(batchResults.filter(r=>r.txHash).map(r=>
       sbPatch(ENV.sbUrl,ENV.sbKey,`news?url=eq.${encodeURIComponent(r.url)}`,{tx_hash:r.txHash,is_verified:true,blockchain_registered_at:new Date().toISOString()},`tx ${r.url}`)
     ));
 
-    // Step 4: Batch check already-registered articles for full verification data
+    // Batch verify all registered articles
     const registeredArts=preRanked.filter(a=>a.description?.trim());
     const batchChecks=await checkBatchOnChain(registeredArts.map(a=>({content:a.description,cachedHash:null})));
     const checkMap=new Map(registeredArts.map((a,i)=>[a.url,batchChecks[i]]));
 
     // ── Build final articles with blockchain verification ─────────────────
-    const articles=await Promise.all(preRanked.map(async(a,i)=>{
+    const articles=await Promise.all(preRanked.map(async a=>{
       const reg=txMap.get(a.url);
       const chk=checkMap.get(a.url);
-      const txHash=reg?.txHash??null;
-      const isRegistered=!!txHash||!!reg?.alreadyRegistered;
-      // restore existing tx_hash from DB if already registered
-      let finalTxHash=txHash;
-      if(reg?.alreadyRegistered&&!finalTxHash){
+      let txHash=reg?.txHash??null;
+      // Restore existing tx_hash from DB if already registered
+      if(reg?.alreadyRegistered&&!txHash){
         try{
           const r=await fetch(`${ENV.sbUrl}/rest/v1/news?url=eq.${encodeURIComponent(a.url)}&select=tx_hash`,{headers:{apikey:ENV.sbKey,Authorization:`Bearer ${ENV.sbKey}`}});
           const rows=await r.json();
-          if(rows?.[0]?.tx_hash)finalTxHash=rows[0].tx_hash;
+          if(rows?.[0]?.tx_hash)txHash=rows[0].tx_hash;
         }catch{}
       }
+      const isRegistered=!!(txHash||reg?.alreadyRegistered);
       return{
-        title:a.title,
-        description:a.description??a.summary??"",
-        url:a.url,
-        image:a.image??null,
-        source:a.source?.name??a.source??"Unknown",
-        published_at:a.publishedAt??new Date().toISOString(),
-        freshness_label:freshLabel(a.publishedAt),
-        cluster_tag:a.tier??"general",
-        relevance_score:a.relevance_score??0.85,
+        title:                a.title,
+        description:          a.description??a.summary??"",
+        url:                  a.url,
+        image:                a.image??null,
+        source:               a.source?.name??a.source??"Unknown",
+        published_at:         a.publishedAt??new Date().toISOString(),
+        freshness_label:      freshLbl(a.publishedAt),
+        cluster_tag:          a.tier??"general",
+        relevance_score:      a.relevance_score??0.85,
         personalization_score:a.personalization_score??null,
-        why_recommended:a.why_recommended??null,
-        tier:a.tier??"general",
+        why_recommended:      a.why_recommended??null,
+        tier:                 a.tier??"general",
         blockchain_verification:isRegistered?{
           status:"registered",registered:true,
           verified:chk?.verified??true,
           publisher:chk?.publisher??null,
           registered_at:chk?.timestamp??new Date().toISOString(),
           contract_address:CONTRACT_ADDRESS??null,
-          tx_hash:finalTxHash,
+          tx_hash:txHash,
           badge:"✅ Verified on-chain",
           content_hash:a.description?"0x"+await hashArticle(a.description):null,
-        }:NO_BV({tx_hash:null}),
+        }:NO_BV(),
       };
     }));
 
-    // Update cache AFTER blockchain so tx_hashes are included
-    if(coverage_tier!=="recovery"&&articles.some(a=>a.tier!=="placeholder"))
+    // Cache after blockchain so tx_hashes are included
+    if(articles.length>0)
       setCache(cacheKey,{digest_summary,digest_source_urls,digest_reliability,coverage_tier});
 
     // ── Response ──────────────────────────────────────────────────────────
     return new Response(JSON.stringify({
       success:true,
-      search:{original:rawTopic,normalized_for_display:displayTopic,normalized_for_search:searchQuery,query_expansions:queries,region:regionKey,intent,entityType,coverage_tier},
-      digest:{summary:digest_summary,reliability:digest_reliability,source_count:digest_source_urls.length,source_urls:digest_source_urls,coverage_quality:coverage_tier},
+      search:{
+        original:rawTopic,normalized_for_display:displayTopic,
+        normalized_for_search:searchQuery,query_expansions:queries,
+        region:regionKey,intent,entityType,coverage_tier,
+      },
+      digest:{
+        summary:digest_summary,reliability:digest_reliability,
+        source_count:digest_source_urls.length,source_urls:digest_source_urls,
+        coverage_quality:coverage_tier,
+        wikipedia_background:wiki??null,
+        wikidata_context:wikidata??null,
+      },
       articles,
-      wikidata:wikidata??null,
-      blockchain:{enabled:!!CONTRACT_ADDRESS,contract_address:CONTRACT_ADDRESS??null,network:getNetworkType(),verified_count:articles.filter(a=>a.blockchain_verification?.registered).length,total_articles:articles.length,coverage:"all"},
+      blockchain:{
+        enabled:!!CONTRACT_ADDRESS,
+        contract_address:CONTRACT_ADDRESS??null,
+        network:getNetworkType(),
+        verified_count:articles.filter(a=>a.blockchain_verification?.registered).length,
+        total_articles:articles.length,
+        coverage:"all",
+      },
       meta:{
         source_breakdown:sourceCounts,
         total_before_dedupe:allArticles.length,
         total_after_dedupe:finalArticles.length,
         blockchain_registered:batchResults.filter(r=>r.success).length,
-        guaranteed_coverage:true,
-        min_articles_guaranteed:5,
         auth_status:isLoggedIn?"logged_in":"anonymous",
         searches_remaining:isLoggedIn?"unlimited":0,
         timestamp:new Date().toISOString(),
@@ -196,15 +207,16 @@ serve(async(req:Request)=>{
     },null,2),{headers:{"Content-Type":"application/json","Cache-Control":"public, max-age=300"}});
 
   }catch(err:any){
+    // ── Error — honest message, zero fake articles ────────────────────────
     console.error("🔥",err);
-    const placeholders=generateTier12Placeholder("global events").map(a=>({...a,blockchain_verification:NO_BV()}));
     return new Response(JSON.stringify({
-      success:true,error:"Service degradation",
-      message:"Experiencing high demand. Showing contextual information while restoring full coverage.",
-      articles:placeholders,
-      digest:{summary:"🌍 **Global Context**\nShowing baseline info during recovery.",reliability:3.0,source_count:1,source_urls:["https://en.wikipedia.org/wiki/Current_events"],coverage_quality:"recovery"},
+      success:false,
+      error:"Service error",
+      message:"Failed to fetch news. Please try again shortly.",
+      articles:[],
+      digest:{summary:"Unable to fetch news at this time. Please try again.",reliability:0,source_count:0,source_urls:[],coverage_quality:"error"},
       blockchain:{enabled:!!CONTRACT_ADDRESS,contract_address:CONTRACT_ADDRESS??null,network:getNetworkType()},
-      meta:{guaranteed_coverage:true,coverage_tier:"recovery",timestamp:new Date().toISOString()},
-    }),{status:200,headers:{"Content-Type":"application/json"}});
+      meta:{timestamp:new Date().toISOString()},
+    }),{status:500,headers:{"Content-Type":"application/json"}});
   }
 });
