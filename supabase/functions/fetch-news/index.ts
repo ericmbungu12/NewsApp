@@ -91,7 +91,7 @@ async function rankWithRL(articles:any[],query:string,twin:any|null):Promise<any
         }:null,
         query,
       }),
-      signal:AbortSignal.timeout(8000),
+      signal:AbortSignal.timeout(30000),
     });
     if(!r.ok){ console.warn("RL error:",r.status); return articles; }
     const data=await r.json();
