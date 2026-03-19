@@ -18,7 +18,6 @@ import { extractCoreEntity, embedText, toVectorString } from "./fuzzy_search.ts"
 // ── In-memory cache + anon rate limit ────────────────────────────────────────
 const cache    = new Map<string, { expiry: number; data: unknown }>();
 const anonHits = new Map<string, number>();
-const BLOCKCHAIN_LIMIT = 20;
 
 const getIP    = (req: Request) =>
   req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
@@ -64,6 +63,59 @@ const sbPatch = (url: string, key: string, path: string, body: unknown) =>
     body:    JSON.stringify(body),
     signal:  AbortSignal.timeout(5000),
   }).catch(e => console.warn(`sbPatch ${path}: ${e.message}`));
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOPIC SPECIFICITY SPLIT
+// Determines which articles are genuinely about the searched topic vs
+// which are general/off-topic news that happened to pass the relevance floor.
+//
+// "AFCON Morocco Senegal" search:
+//   topicSpecific → articles containing "afcon", "morocco", "senegal"
+//   offTopic      → Iran war, Cuba, Pakistan, NZ rugby, etc.
+//
+// "flood Tezpur" search:
+//   topicSpecific → articles containing "flood", "tezpur", "assam"
+//   offTopic      → everything else
+//
+// Works for ANY topic — no hardcoded categories needed.
+// ════════════════════════════════════════════════════════════════════════════
+function splitByTopicRelevance(
+  articles: any[],
+  core: string
+): { topicSpecific: any[]; offTopic: any[] } {
+
+  // Extract meaningful words from the core entity (length > 3 to skip noise)
+  const topicWords = core
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(w => w.length > 3);
+
+  // If no meaningful topic words (e.g. query is "news"), everything is topic-specific
+  if (topicWords.length === 0) {
+    return {
+      topicSpecific: articles.filter(a => a.description?.trim()),
+      offTopic:      [],
+    };
+  }
+
+  const isTopicMatch = (a: any): boolean => {
+    if (!a.description?.trim() && !a.title?.trim()) return false;
+    const text = `${a.title ?? ""} ${a.description ?? ""}`.toLowerCase();
+    // Article must contain at least ONE topic keyword in title or description
+    return topicWords.some(w => text.includes(w));
+  };
+
+  const topicSpecific = articles.filter(isTopicMatch);
+  const offTopic      = articles.filter(a => !isTopicMatch(a));
+
+  console.log(
+    `🎯 Topic split: ${topicSpecific.length} topic-specific` +
+    ` | ${offTopic.length} off-topic` +
+    ` | keywords: [${topicWords.join(", ")}]`
+  );
+
+  return { topicSpecific, offTopic };
+}
 
 // ── Vector search helpers ─────────────────────────────────────────────────────
 async function vectorSearchNews(
@@ -133,18 +185,25 @@ async function rankWithRL(
         } : null,
         query,
       }),
-      // ← increased from 8000 to survive Render free tier cold starts (~30s)
+      // 30s timeout — survives Render free tier cold start (~25s)
       signal: AbortSignal.timeout(30000),
     });
     if (!r.ok) { console.warn("RL error:", r.status); return articles; }
     const data = await r.json();
-    console.log(`🤖 RL ranked ${data.total} | personalized=${data.personalized} | verified_in_top=${data.verified_in_top ?? 0}`);
+    console.log(
+      `🤖 RL ranked ${data.total}` +
+      ` | personalized=${data.personalized}` +
+      ` | verified_in_top=${data.verified_in_top ?? 0}`
+    );
     return data.ranked_articles.map((ra: any) => ({
       ...(articles.find(a => a.url === ra.article.url) ?? ra.article),
       personalization_score: ra.personalization_score,
       why_recommended:       ra.why,
     }));
-  } catch (e: any) { console.warn("RL unavailable:", e.message); return articles; }
+  } catch (e: any) {
+    console.warn("RL unavailable:", e.message);
+    return articles;
+  }
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -168,9 +227,9 @@ serve(async (req: Request) => {
 
   try {
     // ── Auth + rate limit ──────────────────────────────────────────────────
-    const ip          = getIP(req);
-    const authHeader  = req.headers.get("Authorization");
-    const isLoggedIn  = !!authHeader?.match(/^Bearer .{33,}/);
+    const ip         = getIP(req);
+    const authHeader = req.headers.get("Authorization");
+    const isLoggedIn = !!authHeader?.match(/^Bearer .{33,}/);
     if (!isLoggedIn) {
       if ((anonHits.get(ip) ?? 0) >= 1)
         return new Response(
@@ -192,7 +251,7 @@ serve(async (req: Request) => {
     const entityType   = detectEntityType(rawTopic, rawTopic);
     const queries      = expandQueryForCoverage(rawTopic, regionKey, entityType);
     const cacheKey     = `digest_${displayTopic}_${regionKey}`;
-    console.log(`🔍 "${rawTopic}" → "${core}" | region=${regionKey} | intent=${intent}`);
+    console.log(`\n🔍 "${rawTopic}" → "${core}" | region=${regionKey} | intent=${intent}`);
 
     // ── Load digital twin (non-blocking on failure) ────────────────────────
     let userTwin: any = null;
@@ -228,7 +287,11 @@ serve(async (req: Request) => {
 
     // ── PHASE 2: Merge + synthesize ────────────────────────────────────────
     const mergedArticles = dedup([...freshResult.articles, ...vectorArticles]);
-    console.log(`📊 Fresh:${freshResult.articles.length} Vector:${vectorArticles.length} Merged:${mergedArticles.length}`);
+    console.log(
+      `📊 Fresh:${freshResult.articles.length}` +
+      ` Vector:${vectorArticles.length}` +
+      ` Merged:${mergedArticles.length}`
+    );
 
     const {
       digest_source_urls, digest_reliability,
@@ -245,56 +308,82 @@ serve(async (req: Request) => {
     }));
     const allRanked = await rankWithRL(rlInput, displayTopic, userTwin);
 
-    // ── PHASE 4: Slice — top 20 for blockchain, rest unverified ───────────
-    const top20   = allRanked.slice(0, BLOCKCHAIN_LIMIT).filter(a => a.description?.trim());
-    const theRest = allRanked.slice(BLOCKCHAIN_LIMIT);
-    console.log(`🔗 Blockchain: ${top20.length} | Unverified: ${theRest.length}`);
+    // ── PHASE 4: TOPIC SPLIT ───────────────────────────────────────────────
+    // topicSpecific = articles genuinely about the searched topic
+    //                 → these get blockchain registration + GROQ digest
+    //                 → appear FIRST in the response
+    //
+    // offTopic      = general/breaking news that passed the relevance floor
+    //                 but is NOT about the searched topic
+    //                 → no blockchain → Gemini digest
+    //                 → appears AFTER topic-specific articles
+    //
+    // Example: search "AFCON Morocco Senegal"
+    //   topicSpecific → all AFCON/Morocco/Senegal articles (verified)
+    //   offTopic      → Iran war, Cuba, Pakistan news (unverified)
+    const { topicSpecific, offTopic } = splitByTopicRelevance(allRanked, core);
+    console.log(
+      `🔗 To blockchain: ${topicSpecific.length} topic-specific` +
+      ` | Unverified off-topic: ${offTopic.length}`
+    );
 
     // ── PHASE 5: CONCURRENT — blockchain + GROQ + Gemini ──────────────────
-    // All three start at the exact same tick. Total wait = slowest of the three.
+    // All three start at exactly the same tick.
+    // registerBatchOnChain handles its own internal rate limiting:
+    //   - single batch TX for all topic-specific articles (1 gas TX regardless of count)
+    //   - pre-check in sub-batches of 5 with 300ms between sub-batches
+    //   - exponential backoff (500ms→1s→2s) on 429 from Alchemy free tier
+    //   - cache prevents re-checking already-registered articles
     const [batchResults, verified_digest, unverified_digest] = await Promise.all([
-      // Alchemy EVM — only top 20
-      registerBatchOnChain(top20.map(a => ({ content: a.description, url: a.url })), 200),
-      // GROQ llama-3.1-8b-instant — verified section
-      generateVerifiedDigest(top20, displayTopic, ENV.groq ?? ""),
-      // Gemini 2.0 Flash — unverified section
-      generateUnverifiedDigest(theRest, displayTopic, ENV.gemini ?? ""),
+      // Alchemy EVM — ALL topic-specific articles (not a fixed 20)
+      registerBatchOnChain(
+        topicSpecific.map(a => ({ content: a.description, url: a.url })),
+        200  // 200ms between sequential fallback TXs (only used if batch TX fails)
+      ),
+      // GROQ llama-3.1-8b-instant — summarises verified/topic-specific articles
+      generateVerifiedDigest(topicSpecific, displayTopic, ENV.groq ?? ""),
+      // Gemini 2.0 Flash — summarises off-topic/general news
+      generateUnverifiedDigest(offTopic, displayTopic, ENV.gemini ?? ""),
     ]);
 
     const txMap = new Map(batchResults.map(r => [r.url, r]));
 
-    // Persist tx_hashes to Supabase — fire and forget, never blocks response
+    // Persist tx_hashes to Supabase — fire and forget
     batchResults.filter(r => r.txHash).forEach(r =>
       sbPatch(ENV.sbUrl, ENV.sbKey,
         `news?url=eq.${encodeURIComponent(r.url)}`,
-        { tx_hash: r.txHash, is_verified: false, blockchain_registered_at: new Date().toISOString() }
+        {
+          tx_hash:                   r.txHash,
+          is_verified:               false,
+          blockchain_registered_at:  new Date().toISOString(),
+        }
       )
     );
 
-    // ── Automatic verification — fire and forget ───────────────────────────
+    // ── Fire-and-forget verification ───────────────────────────────────────
     // VERIFIER_PRIVATE_KEY (Account 2) calls verifyBatch() on the contract.
-    // Does not block the response — runs in background after registration.
-    // Cache is updated inside verifyBatchOnChain so next request sees verified:true.
+    // Runs after registration — does not block the response.
+    // blockchain.ts cache is updated so next request sees verified: true.
     verifyBatchOnChain(
-      top20
+      topicSpecific
         .filter(a => txMap.get(a.url)?.success)
         .map(a => ({ content: a.description }))
     ).catch(() => {});
 
-    // Batch check verified status — reads from cache first (0 RPC if cached)
+    // Batch check on-chain verified status (cache-first — 0 RPC calls on hit)
     const batchChecks = await checkBatchOnChain(
-      top20.map(a => ({ content: a.description, cachedHash: null }))
+      topicSpecific.map(a => ({ content: a.description, cachedHash: null }))
     );
-    const checkMap = new Map(top20.map((a, i) => [a.url, batchChecks[i]]));
+    const checkMap = new Map(topicSpecific.map((a, i) => [a.url, batchChecks[i]]));
 
-    // ── PHASE 6: Build article objects — top20 + rest in parallel ─────────
-    const buildArticle = async (a: any, inTop20: boolean) => {
-      const reg    = txMap.get(a.url);
-      const chk    = checkMap.get(a.url);
-      let txHash   = reg?.txHash ?? null;
+    // ── PHASE 6: Build article objects ─────────────────────────────────────
+    const buildArticle = async (a: any, isTopicArticle: boolean) => {
+      const reg   = txMap.get(a.url);
+      const chk   = checkMap.get(a.url);
+      let txHash  = reg?.txHash ?? null;
 
-      // Look up existing tx_hash from DB if this was already-registered
-      if (inTop20 && reg?.alreadyRegistered && !txHash) {
+      // Retrieve existing tx_hash from DB if already registered
+      if (isTopicArticle && reg?.alreadyRegistered && !txHash) {
         try {
           const r = await fetch(
             `${ENV.sbUrl}/rest/v1/news?url=eq.${encodeURIComponent(a.url)}&select=tx_hash`,
@@ -308,7 +397,7 @@ serve(async (req: Request) => {
         } catch {}
       }
 
-      const isRegistered = inTop20 && !!(txHash || reg?.alreadyRegistered);
+      const isRegistered = isTopicArticle && !!(txHash || reg?.alreadyRegistered);
 
       return {
         title:                 a.title,
@@ -326,63 +415,69 @@ serve(async (req: Request) => {
         blockchain_verification: isRegistered ? {
           status:           "registered",
           registered:       true,
-          // ← fixed: defaults to false (honest) not true (bug)
-          verified:         chk?.verified ?? false,
+          verified:         chk?.verified ?? false,      // honest default
           publisher:        chk?.publisher ?? null,
           registered_at:    chk?.timestamp ?? new Date().toISOString(),
           contract_address: CONTRACT_ADDRESS ?? null,
           tx_hash:          txHash,
-          // ← fixed: "Registered" not "Verified" — honest about what happened
-          badge:            "✅ Registered on-chain",
-          content_hash:     a.description ? "0x" + await hashArticle(a.description) : null,
+          badge:            "✅ Registered on-chain",    // honest — not "Verified"
+          content_hash:     a.description
+            ? "0x" + await hashArticle(a.description)
+            : null,
         } : NO_BV(),
       };
     };
 
-    // Both lists build in parallel
-    const [verifiedArticleObjs, unverifiedArticleObjs] = await Promise.all([
-      Promise.all(top20.map(a => buildArticle(a, true))),
-      Promise.all(theRest.map(a => buildArticle(a, false))),
+    // Build both lists in parallel
+    const [topicArticleObjs, offTopicArticleObjs] = await Promise.all([
+      Promise.all(topicSpecific.map(a => buildArticle(a, true))),
+      Promise.all(offTopic.map(a => buildArticle(a, false))),
     ]);
 
-    // Articles whose TX failed move to unverified group
-    const confirmedVerified = verifiedArticleObjs.filter(a => a.blockchain_verification.registered);
-    const failedVerified    = verifiedArticleObjs.filter(a => !a.blockchain_verification.registered);
-    const allUnverified     = [...failedVerified, ...unverifiedArticleObjs];
-    const articles          = [...confirmedVerified, ...allUnverified]; // verified always first
+    // Separate registered from failed within topic-specific group
+    const confirmedRegistered = topicArticleObjs.filter(a => a.blockchain_verification.registered);
+    const failedRegistration  = topicArticleObjs.filter(a => !a.blockchain_verification.registered);
 
-    // ── PHASE 7: Persist — ALL fire-and-forget, never blocks response ──────
+    // Final article order:
+    //   1. Topic-specific registered on-chain  (verified section)
+    //   2. Topic-specific that failed TX       (moved to unverified)
+    //   3. Off-topic general/breaking news     (unverified section)
+    const allUnverified = [...failedRegistration, ...offTopicArticleObjs];
+    const articles      = [...confirmedRegistered, ...allUnverified];
+
+    // ── PHASE 7: Persist — ALL fire-and-forget ─────────────────────────────
     upsertDigestToSupabase(
       ENV.sbUrl, ENV.sbKey, rawTopic, regionKey,
       verified_digest, unverified_digest,
       digest_reliability, digest_source_urls
     ).catch(() => {});
 
-    // Verified articles inserted first so DB read order matches response order
+    // Topic-specific registered articles inserted first
     insertArticlesToSupabase(
       ENV.sbUrl, ENV.sbKey,
-      confirmedVerified.map(a => ({ ...a, publishedAt: a.published_at })),
+      confirmedRegistered.map(a => ({ ...a, publishedAt: a.published_at })),
       rawTopic, regionKey, CONTRACT_ADDRESS ?? null
     ).catch(() => {});
 
+    // Off-topic + failed articles
     insertArticlesToSupabase(
       ENV.sbUrl, ENV.sbKey,
       allUnverified.map(a => ({ ...a, publishedAt: a.published_at })),
-      rawTopic, regionKey, null // null contract_address = unverified
+      rawTopic, regionKey, null
     ).catch(() => {});
 
     setCache(cacheKey, { verified_digest, unverified_digest, digest_reliability, coverage_tier });
 
-    // ── PHASE 8: Respond immediately ──────────────────────────────────────
+    // ── PHASE 8: Respond ───────────────────────────────────────────────────
     return new Response(JSON.stringify({
       success: true,
       search: {
-        original:                rawTopic,
-        core_entity:             core,
-        normalized_for_display:  displayTopic,
-        normalized_for_search:   searchQuery,
-        query_expansions:        queries,
-        region:                  regionKey,
+        original:               rawTopic,
+        core_entity:            core,
+        normalized_for_display: displayTopic,
+        normalized_for_search:  searchQuery,
+        query_expansions:       queries,
+        region:                 regionKey,
         intent,
         entityType,
         coverage_tier,
@@ -390,7 +485,7 @@ serve(async (req: Request) => {
       digest: {
         verified_digest,
         unverified_digest,
-        summary:              `✅ VERIFIED:\n${verified_digest}\n\n⚠️ UNVERIFIED:\n${unverified_digest}`,
+        summary:              `✅ TOPIC-SPECIFIC (ON-CHAIN):\n${verified_digest}\n\n⚠️ GENERAL NEWS (OFF-TOPIC):\n${unverified_digest}`,
         reliability:          digest_reliability,
         source_count:         digest_source_urls.length,
         source_urls:          digest_source_urls,
@@ -401,24 +496,27 @@ serve(async (req: Request) => {
       },
       articles,
       blockchain: {
-        enabled:          !!CONTRACT_ADDRESS,
-        contract_address: CONTRACT_ADDRESS ?? null,
-        network:          getNetworkType(),
-        verified_count:   confirmedVerified.length,
-        unverified_count: allUnverified.length,
-        total_articles:   articles.length,
-        coverage:         `top_${BLOCKCHAIN_LIMIT}_only`,
+        enabled:                  !!CONTRACT_ADDRESS,
+        contract_address:         CONTRACT_ADDRESS ?? null,
+        network:                  getNetworkType(),
+        topic_specific_count:     confirmedRegistered.length,
+        off_topic_count:          allUnverified.length,
+        total_articles:           articles.length,
+        coverage:                 "all_topic_specific",   // ← was "top_20_only"
+        verification_strategy:    "topic_keyword_match",
       },
       meta: {
-        source_breakdown:        sourceCounts,
-        total_fresh:             freshResult.articles.length,
-        total_from_vector_db:    vectorArticles.length,
-        total_merged:            mergedArticles.length,
-        total_after_synthesis:   finalArticles.length,
-        blockchain_registered:   batchResults.filter(r => r.success).length,
-        auth_status:             isLoggedIn ? "logged_in" : "anonymous",
-        searches_remaining:      isLoggedIn ? "unlimited" : 0,
-        timestamp:               new Date().toISOString(),
+        source_breakdown:      sourceCounts,
+        total_fresh:           freshResult.articles.length,
+        total_from_vector_db:  vectorArticles.length,
+        total_merged:          mergedArticles.length,
+        total_after_synthesis: finalArticles.length,
+        topic_specific:        topicSpecific.length,
+        off_topic:             offTopic.length,
+        blockchain_registered: batchResults.filter(r => r.success).length,
+        auth_status:           isLoggedIn ? "logged_in" : "anonymous",
+        searches_remaining:    isLoggedIn ? "unlimited" : 0,
+        timestamp:             new Date().toISOString(),
       },
     }, null, 2), {
       headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" },
