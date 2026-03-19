@@ -11,8 +11,8 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="DataLoom RL Engine", version="2.0.0")
-logger.info("DataLoom RL Engine v2 ready — TF-IDF + blockchain trust signal")
+app = FastAPI(title="DataLoom RL Engine", version="2.1.0")
+logger.info("DataLoom RL Engine v2.1 ready — TF-IDF + blockchain trust + accurate why-reasons")
 
 # ── Weight table — must sum to 1.0 ────────────────────────────────────────────
 W_QUERY      = 0.30
@@ -21,6 +21,16 @@ W_TOPIC      = 0.20
 W_SOURCE     = 0.15
 W_ENGAGEMENT = 0.10
 W_FRESHNESS  = 0.05
+
+# Weighted contribution per factor key — used for dominant-factor detection
+FACTOR_WEIGHTS: Dict[str, float] = {
+    "query_relevance":   W_QUERY,
+    "blockchain_trust":  W_BLOCKCHAIN,
+    "topic_preference":  W_TOPIC,
+    "source_preference": W_SOURCE,
+    "engagement":        W_ENGAGEMENT,
+    "freshness":         W_FRESHNESS,
+}
 
 FRESHNESS_SCORES: Dict[str, float] = {
     "breaking":  1.0,
@@ -83,11 +93,11 @@ class RankResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "DataLoom RL Engine", "version": "2.0.0"}
+    return {"status": "ok", "service": "DataLoom RL Engine", "version": "2.1.0"}
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "model": "tfidf-blockchain-v2"}
+    return {"status": "healthy", "model": "tfidf-blockchain-v2.1"}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -154,7 +164,7 @@ def _tfidf_scores(articles: List[Article], query: str) -> List[float]:
     fallback = default[MAX_TFIDF_ARTICLES:]
 
     try:
-        vectorizer   = TfidfVectorizer(
+        vectorizer = TfidfVectorizer(
             stop_words="english",
             max_features=3000,   # vocabulary cap ~12MB for 150 docs
             sublinear_tf=True,
@@ -168,6 +178,63 @@ def _tfidf_scores(articles: List[Article], query: str) -> List[float]:
     except Exception as e:
         logger.warning(f"TF-IDF error: {e}")
         return default
+
+
+def _build_why(
+    why_parts: List[str],
+    breakdown: Dict[str, float],
+    query: str,
+    article: Article,
+    q: float,
+    bc: float,
+    fr: float,
+    tp: float,
+    sp: float,
+) -> str:
+    """
+    Build a human-readable 'why recommended' string.
+
+    If why_parts already has content (thresholds crossed), join them.
+    Otherwise fall back to the DOMINANT scoring factor so the reason
+    is always accurate — never a generic 'trending' when something
+    specific drove the score.
+    """
+    if why_parts:
+        return "Recommended because it's " + ", and ".join(why_parts)
+
+    # Weighted contribution of each raw score
+    weighted = {
+        "query_relevance":   q   * W_QUERY,
+        "blockchain_trust":  bc  * W_BLOCKCHAIN,
+        "topic_preference":  tp  * W_TOPIC,
+        "source_preference": sp  * W_SOURCE,
+        "freshness":         fr  * W_FRESHNESS,
+    }
+
+    dominant = max(weighted, key=lambda k: weighted[k])
+    dominant_value = weighted[dominant]
+
+    # Only use dominant label if it meaningfully contributed
+    if dominant_value < 0.02:
+        return "Trending news in your region"
+
+    if dominant == "query_relevance":
+        return f"Recommended because it's relevant to '{query}'"
+    if dominant == "blockchain_trust":
+        if bc == 1.0:
+            return "Recommended because it was previously verified on-chain"
+        return "Recommended because it is registered on the blockchain"
+    if dominant == "topic_preference":
+        label = article.topic or article.cluster_tag or "your interests"
+        return f"Recommended because it matches your interest in {label}"
+    if dominant == "source_preference":
+        return f"Recommended because it's from {article.source}, a source you trust"
+    if dominant == "freshness":
+        label_map = {1.0: "breaking news", 0.75: "today's news", 0.40: "this week's news"}
+        label = label_map.get(fr, "recent news")
+        return f"Recommended because it's {label}"
+
+    return "Trending news in your region"
 
 # ── Ranking endpoint ──────────────────────────────────────────────────────────
 
@@ -201,13 +268,13 @@ def rank_articles(req: RankRequest):
             why_parts: List[str] = []
             breakdown: Dict[str, float] = {}
 
-            # Query relevance
+            # ── Query relevance ──────────────────────────────────────────────
             q = float(query_scores[i])
             breakdown["query_relevance"] = round(q, 3)
             if q > 0.25:
                 why_parts.append(f"relevant to '{query}'")
 
-            # Blockchain trust
+            # ── Blockchain trust ─────────────────────────────────────────────
             bc = _blockchain_score(article.blockchain_verification)
             breakdown["blockchain_trust"] = round(bc, 3)
             if bc == 1.0:
@@ -215,29 +282,30 @@ def rank_articles(req: RankRequest):
             elif bc > 0:
                 why_parts.append("registered on blockchain")
 
-            # Topic preference
+            # ── Topic preference ─────────────────────────────────────────────
             tp = _topic_score(article, twin.topic_preferences if twin else {})
             breakdown["topic_preference"] = round(tp, 3)
             if tp > 0.5:
-                why_parts.append(f"matches your interest in {article.topic or article.cluster_tag}")
+                label = article.topic or article.cluster_tag
+                why_parts.append(f"matches your interest in {label}")
 
-            # Source preference
+            # ── Source preference ────────────────────────────────────────────
             sp = _source_score(article, twin.source_preferences if twin else {})
             breakdown["source_preference"] = round(sp, 3)
             if sp > 0.5:
                 why_parts.append(f"from {article.source}, a source you trust")
 
-            # Engagement (source-modulated)
+            # ── Engagement (source-modulated) ────────────────────────────────
             eng = engagement_base * (0.5 + sp * 0.5)
             breakdown["engagement"] = round(eng, 3)
 
-            # Freshness
+            # ── Freshness ────────────────────────────────────────────────────
             fr = FRESHNESS_SCORES.get(article.freshness_label or "", 0.25)
             breakdown["freshness"] = round(fr, 3)
             if fr >= 0.75:
                 why_parts.append("breaking or today's news")
 
-            # Weighted total
+            # ── Weighted total ───────────────────────────────────────────────
             final = (
                 q   * W_QUERY      +
                 bc  * W_BLOCKCHAIN +
@@ -249,10 +317,13 @@ def rank_articles(req: RankRequest):
             final = round(min(max(final, 0.0), 1.0), 4)
             breakdown["final_score"] = final
 
-            why = (
-                "Recommended because it's " + ", and ".join(why_parts)
-                if why_parts else
-                "Trending news in your region"
+            # ── Accurate why string ──────────────────────────────────────────
+            why = _build_why(
+                why_parts=why_parts,
+                breakdown=breakdown,
+                query=query,
+                article=article,
+                q=q, bc=bc, fr=fr, tp=tp, sp=sp,
             )
 
             scored.append(RankedArticle(
