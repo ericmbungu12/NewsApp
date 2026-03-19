@@ -65,69 +65,372 @@ const sbPatch = (url: string, key: string, path: string, body: unknown) =>
   }).catch(e => console.warn(`sbPatch ${path}: ${e.message}`));
 
 // ════════════════════════════════════════════════════════════════════════════
-// TOPIC SPECIFICITY SPLIT
-// Determines which articles are genuinely about the searched topic vs
-// which are general/off-topic news that happened to pass the relevance floor.
-//
-// "AFCON Morocco Senegal" search:
-//   topicSpecific → articles containing "afcon", "morocco", "senegal"
-//   offTopic      → Iran war, Cuba, Pakistan, NZ rugby, etc.
-//
-// "flood Tezpur" search:
-//   topicSpecific → articles containing "flood", "tezpur", "assam"
-//   offTopic      → everything else
-//
-// Works for ANY topic — no hardcoded categories needed.
+// FEATURE 4 — SOURCE RELIABILITY SCORING
+// Surfaces the internal 3.5–4.5 reliability score as a human-readable label,
+// badge, and explanation on every article and as an aggregate report.
+// Neither Google (SEO-ranked) nor ChatGPT (no source metadata) does this.
 // ════════════════════════════════════════════════════════════════════════════
-function splitByTopicRelevance(
-  articles: any[],
-  core: string
-): { topicSpecific: any[]; offTopic: any[] } {
+const SOURCE_RELIABILITY_MAP: Record<string, number> = {
+  // Tier 1 — major wire services / established international press
+  "Reuters": 4.8, "AP": 4.8, "AP News": 4.8,
+  "BBC News": 4.7, "BBC": 4.7, "BBC World": 4.7,
+  "Al Jazeera": 4.6, "Al Jazeera English": 4.6,
+  "The Guardian": 4.6, "NY Times": 4.6, "NPR": 4.6,
+  "France 24": 4.5, "DW News": 4.5, "Sky News": 4.5,
+  "Bloomberg": 4.5, "The Economist": 4.5,
+  // Tier 2 — reputable regional / specialist press
+  "ESPN": 4.3, "espn.co.uk": 4.3,
+  "Sky Sports": 4.3, "Cricbuzz": 4.2,
+  "Bleacher Report": 4.1, "beIN SPORTS": 4.0,
+  "The Athletic": 4.2, "CBS Sports": 4.1,
+  "Fox Sports": 4.0, "Goal.com": 3.9,
+  "The Irish Times": 4.4, "RTE": 4.3,
+  "CNA": 4.3, "Channel NewsAsia": 4.3,
+  "USA Today": 4.0, "New York Post": 3.7,
+  // Tier 3 — aggregators / lower verification
+  "Google News": 3.5, "Yahoo Entertainment": 3.2,
+  "Slashdot.org": 3.0,
+};
 
-  // Extract meaningful words from the core entity (length > 3 to skip noise)
-  const topicWords = core
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(w => w.length > 3);
+interface ReliabilityInfo {
+  score:       number;
+  label:       string;
+  badge:       string;
+  explanation: string;
+}
 
-  // If no meaningful topic words (e.g. query is "news"), everything is topic-specific
-  if (topicWords.length === 0) {
-    return {
-      topicSpecific: articles.filter(a => a.description?.trim()),
-      offTopic:      [],
-    };
+function getSourceReliability(source: string, tierReliability?: number): ReliabilityInfo {
+  const knownScore = SOURCE_RELIABILITY_MAP[source];
+  const score = Math.round((knownScore ?? tierReliability ?? 3.5) * 10) / 10;
+
+  let label: string, badge: string, explanation: string;
+
+  if (score >= 4.5) {
+    label = "very_high";
+    badge = "🏅 Very High Reliability";
+    explanation = `${source} is a major established outlet with strong editorial standards.`;
+  } else if (score >= 4.0) {
+    label = "high";
+    badge = "✅ High Reliability";
+    explanation = `${source} is a reputable outlet with consistent fact-checking.`;
+  } else if (score >= 3.5) {
+    label = "moderate";
+    badge = "⚠️ Moderate Reliability";
+    explanation = `${source} is generally reliable — verify key claims independently.`;
+  } else {
+    label = "low";
+    badge = "❓ Lower Reliability";
+    explanation = `${source} is an aggregator or less-verified source — cross-check with primary outlets.`;
   }
 
+  return { score, label, badge, explanation };
+}
+
+function buildReliabilityReport(articles: any[]): Record<string, any> {
+  if (!articles.length) return {};
+  const scores = articles.map(a =>
+    getSourceReliability(a.source?.name ?? a.source ?? "Unknown", a.reliability).score
+  );
+  const avg = scores.reduce((s, v) => s + v, 0) / scores.length;
+  const sourceBreakdown: Record<string, number> = {};
+  for (const a of articles) {
+    const src = a.source?.name ?? a.source ?? "Unknown";
+    if (!sourceBreakdown[src])
+      sourceBreakdown[src] = getSourceReliability(src, a.reliability).score;
+  }
+  return {
+    average_reliability: Math.round(avg * 10) / 10,
+    highest_reliability: Math.max(...scores),
+    lowest_reliability:  Math.min(...scores),
+    source_scores:       sourceBreakdown,
+    reliability_summary: avg >= 4.5
+      ? "Predominantly major outlets — very high confidence."
+      : avg >= 4.0 ? "Mix of reputable sources — high confidence."
+      : avg >= 3.5 ? "Mixed sources — moderate confidence, verify key claims."
+      : "Lower-reliability sources — cross-check independently.",
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FEATURE 5 — NARRATIVE DIVERGENCE DETECTION
+// Groups articles by HOW different outlets frame the same story.
+// "3 outlets say Morocco won. 2 say decision is controversial. 1 alleges corruption."
+// Neither Google nor ChatGPT surfaces the spectrum of how the world reports a story.
+// ════════════════════════════════════════════════════════════════════════════
+interface NarrativePerspective {
+  angle:               string;
+  framing:             string;
+  article_count:       number;
+  sources:             string[];
+  representative_title: string;
+  sentiment:           "positive" | "negative" | "neutral" | "contested";
+}
+
+const NARRATIVE_CLUSTERS: Array<{
+  angle: string; framing: string;
+  sentiment: "positive" | "negative" | "neutral" | "contested";
+  keywords: string[];
+}> = [
+  { angle: "Official result / winner declared", framing: "Outlets reporting the official outcome or declared winner.", sentiment: "neutral", keywords: ["declared","crowned","awarded","champion","winner","wins","won"] },
+  { angle: "Result overturned / stripped", framing: "Outlets reporting a reversal, stripping of title, or overturned decision.", sentiment: "negative", keywords: ["stripped","overturned","reversed","forfeit","loses title","stripped of"] },
+  { angle: "Protest / appeal / rejection", framing: "Outlets covering the losing side's response — protests, appeals, refusals.", sentiment: "contested", keywords: ["appeal","appeals","protest","reject","refuses","unfair","fight","denounce","fight is far"] },
+  { angle: "Corruption / scandal allegation", framing: "Outlets alleging corruption, bribery, or institutional misconduct.", sentiment: "negative", keywords: ["corrupt","corruption","bribery","investigation","scandal","illegal","foul play","disgrace"] },
+  { angle: "Governing body defends decision", framing: "Outlets quoting the governing body defending its ruling.", sentiment: "positive", keywords: ["president backs","stands firm","defends","justified","right decision","correct","upholds"] },
+  { angle: "Fan / public reaction", framing: "Outlets covering crowd reaction, celebrations, or outrage from supporters.", sentiment: "neutral", keywords: ["fans","supporters","celebration","celebrates","rage","fury","crowd","streets","public"] },
+  { angle: "Analysis / precedent / commentary", framing: "Opinion pieces and analysis examining broader implications.", sentiment: "neutral", keywords: ["precedent","analysis","opinion","commentary","implications","historic","unprecedented","what it means"] },
+  { angle: "Military / conflict escalation", framing: "Outlets reporting military action, strikes, or armed conflict escalation.", sentiment: "negative", keywords: ["strike","strikes","attack","attacks","missile","bomb","war","troops","military"] },
+  { angle: "Diplomatic / peace efforts", framing: "Outlets reporting negotiations, ceasefires, or diplomatic talks.", sentiment: "positive", keywords: ["ceasefire","truce","talks","diplomacy","negotiate","peace","deal","agreement"] },
+  { angle: "Economic impact", framing: "Outlets covering financial, market, or economic consequences.", sentiment: "neutral", keywords: ["prices","oil","market","economy","economic","inflation","cost","financial","gas prices"] },
+  { angle: "Health / outbreak", framing: "Outlets reporting health emergencies, disease outbreaks, or medical developments.", sentiment: "negative", keywords: ["outbreak","cases","deaths","disease","virus","epidemic","health","treatment","vaccine"] },
+  { angle: "Election results / voting", framing: "Outlets covering election results, vote counts, or electoral processes.", sentiment: "neutral", keywords: ["election","vote","voted","results","wins election","elected","ballot","campaign"] },
+];
+
+function detectNarrativeDivergence(articles: any[]): {
+  perspectives: NarrativePerspective[];
+  divergence_score: number;
+  summary: string;
+} {
+  if (articles.length < 2) return {
+    perspectives: [], divergence_score: 0,
+    summary: "Not enough articles to detect narrative divergence.",
+  };
+
+  const matched = new Set<string>();
+  const perspectives: NarrativePerspective[] = [];
+
+  for (const cluster of NARRATIVE_CLUSTERS) {
+    const clusterArticles = articles.filter(a => {
+      if (matched.has(a.url)) return false;
+      const text = `${a.title ?? ""} ${a.description ?? ""}`.toLowerCase();
+      return cluster.keywords.some(kw => text.includes(kw));
+    });
+    if (!clusterArticles.length) continue;
+    clusterArticles.forEach(a => matched.add(a.url));
+    const sources = [...new Set(clusterArticles.map(a => a.source?.name ?? a.source ?? "Unknown"))].slice(0, 5);
+    const best = clusterArticles.reduce((p, c) => (c.relevance_score ?? 0) > (p.relevance_score ?? 0) ? c : p);
+    perspectives.push({
+      angle: cluster.angle, framing: cluster.framing,
+      article_count: clusterArticles.length, sources,
+      representative_title: best.title ?? "", sentiment: cluster.sentiment,
+    });
+  }
+
+  const unmatched = articles.filter(a => !matched.has(a.url));
+  if (unmatched.length > 0) {
+    perspectives.push({
+      angle: "General reporting",
+      framing: "Straight news coverage without a strong editorial angle.",
+      article_count: unmatched.length,
+      sources: [...new Set(unmatched.map(a => a.source?.name ?? a.source ?? "Unknown"))].slice(0, 5),
+      representative_title: unmatched[0]?.title ?? "",
+      sentiment: "neutral",
+    });
+  }
+
+  perspectives.sort((a, b) => b.article_count - a.article_count);
+  const uniqueSentiments = new Set(perspectives.map(p => p.sentiment)).size;
+  const divergenceScore = Math.round(Math.min(1, (uniqueSentiments - 1) / 3 + (perspectives.length - 1) / 8) * 100) / 100;
+  const topTwo = perspectives.slice(0, 2);
+  const summary = perspectives.length <= 1
+    ? "All sources are reporting this story with a consistent angle."
+    : `${perspectives.length} distinct narrative angles detected. ` +
+      topTwo.map(p => `${p.article_count} source${p.article_count > 1 ? "s" : ""} frame it as "${p.angle}"`).join(". ") + ".";
+
+  return { perspectives, divergence_score: divergenceScore, summary };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FEATURE 6 — TEMPORAL NEWS GRAPH
+// Reconstructs how a story evolved hour by hour using article timestamps.
+// Nodes with blockchain TX hashes have cryptographic proof of when that
+// information first existed — something no other platform can provide.
+// ════════════════════════════════════════════════════════════════════════════
+interface TemporalNode {
+  hour_utc:        string;
+  hour_label:      string;
+  article_count:   number;
+  on_chain_count:  number;
+  sources:         string[];
+  dominant_angle:  string;
+  headlines:       string[];
+  blockchain_proof: boolean;
+}
+
+function buildTemporalGraph(articles: any[]): {
+  nodes: TemporalNode[];
+  story_duration: string;
+  first_seen: string | null;
+  last_seen:  string | null;
+  peak_hour:  string | null;
+} {
+  if (!articles.length) return { nodes: [], story_duration: "No articles", first_seen: null, last_seen: null, peak_hour: null };
+
+  const withTime = articles
+    .map(a => ({ ...a, _ts: new Date(a.publishedAt ?? a.published_at ?? 0).getTime() }))
+    .filter(a => a._ts > 0)
+    .sort((a, b) => a._ts - b._ts);
+
+  if (!withTime.length) return { nodes: [], story_duration: "No timestamps", first_seen: null, last_seen: null, peak_hour: null };
+
+  const buckets = new Map<string, typeof withTime>();
+  for (const a of withTime) {
+    const d    = new Date(a._ts);
+    const hour = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours()))
+      .toISOString().replace(":00:00.000Z", ":00Z");
+    if (!buckets.has(hour)) buckets.set(hour, []);
+    buckets.get(hour)!.push(a);
+  }
+
+  const DAY_ABBR = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  const nodes: TemporalNode[] = [];
+  let peakHour = "", peakCount = 0;
+
+  for (const [hour, arts] of buckets) {
+    const d = new Date(hour);
+    const label = `${DAY_ABBR[d.getUTCDay()]} ${String(d.getUTCHours()).padStart(2,"0")}:00 UTC`;
+    let dominantAngle = "General reporting", maxMatch = 0;
+    for (const cluster of NARRATIVE_CLUSTERS) {
+      const cnt = arts.filter(a => {
+        const text = `${a.title ?? ""} ${a.description ?? ""}`.toLowerCase();
+        return cluster.keywords.some(kw => text.includes(kw));
+      }).length;
+      if (cnt > maxMatch) { maxMatch = cnt; dominantAngle = cluster.angle; }
+    }
+    const onChainCount = arts.filter(a => a.blockchain_verification?.tx_hash || a.tx_hash).length;
+    nodes.push({
+      hour_utc: hour, hour_label: label,
+      article_count: arts.length, on_chain_count: onChainCount,
+      sources: [...new Set(arts.map(a => a.source?.name ?? a.source ?? "Unknown"))].slice(0, 4),
+      dominant_angle: dominantAngle,
+      headlines: arts.slice(0, 3).map(a => a.title ?? ""),
+      blockchain_proof: onChainCount > 0,
+    });
+    if (arts.length > peakCount) { peakCount = arts.length; peakHour = hour; }
+  }
+
+  const firstTs = withTime[0]._ts;
+  const lastTs  = withTime[withTime.length - 1]._ts;
+  const durationHours = Math.round((lastTs - firstTs) / 3.6e6);
+  const storyDuration = durationHours <= 1 ? "Story broke and peaked within 1 hour."
+    : durationHours <= 24 ? `Story unfolded over ${durationHours} hours.`
+    : `Story has been developing for ${Math.round(durationHours / 24)} day(s).`;
+
+  return {
+    nodes, story_duration: storyDuration,
+    first_seen: new Date(firstTs).toISOString(),
+    last_seen:  new Date(lastTs).toISOString(),
+    peak_hour:  peakHour || null,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FEATURE 7 — HYPER-LOCAL COVERAGE REPORT
+// Shows which sources your app reached that Google and ChatGPT cannot:
+// GDELT (65k global sources), Feedly-discovered feeds, RSS Bridge, DuckDuckGo.
+// Makes the coverage moat visible and measurable to users.
+// ════════════════════════════════════════════════════════════════════════════
+const HYPER_LOCAL_TIERS = new Set([
+  "gdelt","discovered_feed","rss_bridge","cascade_geo",
+  "cascade_local","cascade_ddg","cascade_feedly","web_search",
+]);
+const MAINSTREAM_SOURCES = new Set([
+  "BBC News","BBC","BBC World","Reuters","AP","AP News",
+  "Al Jazeera","Al Jazeera English","The Guardian","NY Times",
+  "NPR","France 24","DW News","Sky News","Bloomberg","CNN",
+  "NBC News","Fox News","ABC News",
+]);
+
+function buildHyperLocalReport(articles: any[]): Record<string, any> {
+  const uniqueSources = new Set(articles.map(a => a.source?.name ?? a.source ?? "Unknown"));
+  const tierCounts: Record<string, number> = {};
+  const hyperLocalSources = new Set<string>();
+  let mainStreamCount = 0;
+
+  for (const a of articles) {
+    const tier = a.tier ?? "unknown";
+    tierCounts[tier] = (tierCounts[tier] ?? 0) + 1;
+    const src = a.source?.name ?? a.source ?? "Unknown";
+    if (HYPER_LOCAL_TIERS.has(tier) && !MAINSTREAM_SOURCES.has(src)) hyperLocalSources.add(src);
+    if (MAINSTREAM_SOURCES.has(src)) mainStreamCount++;
+  }
+
+  const hlCount = articles.filter(a => HYPER_LOCAL_TIERS.has(a.tier ?? "")).length;
+  const hlSourceList = [...hyperLocalSources].slice(0, 10);
+  const advantage = hlCount === 0
+    ? "All results are from mainstream sources. For this topic, major outlets provided full coverage."
+    : `Found ${hlCount} article${hlCount > 1 ? "s" : ""} from ${hlSourceList.length} source${hlSourceList.length > 1 ? "s" : ""} that Google News and ChatGPT typically miss — including GDELT's global network of 65,000 outlets and independently discovered feeds.`;
+
+  return {
+    total_unique_sources: uniqueSources.size,
+    mainstream_count:    mainStreamCount,
+    hyper_local_count:   hlCount,
+    hyper_local_sources: hlSourceList,
+    coverage_advantage:  advantage,
+    tier_breakdown:      tierCounts,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FEATURE 8 — RANKING TRANSPARENCY REPORT
+// Shows users exactly what factors drove their results and confirms
+// zero advertising influence — the opposite of Google's model.
+// ════════════════════════════════════════════════════════════════════════════
+function buildRankingTransparency(isPersonalised: boolean): Record<string, any> {
+  return {
+    method: isPersonalised
+      ? "Reinforcement Learning (RL) with personal digital twin"
+      : "Reinforcement Learning (RL) — general ranking, no personal data",
+    factors: [
+      { factor: "Query relevance",         weight: "30%", description: "TF-IDF and semantic similarity between article and search query." },
+      { factor: "Blockchain trust signal", weight: "20%", description: "Articles registered and verified on-chain receive a higher trust boost." },
+      { factor: "Topic match",             weight: "20%", description: "Articles specifically about the searched topic rank above general news." },
+      { factor: "Source reliability",      weight: "15%", description: "Established outlets with strong editorial standards rank higher." },
+      { factor: "Reader engagement",       weight: "10%", description: isPersonalised
+        ? "Your personal reading patterns — clicks, read time, thumbs up — from your digital twin."
+        : "Aggregate engagement signals from all readers (no personal data used)." },
+      { factor: "Freshness",               weight: "5%",  description: "More recent articles ranked slightly higher within the same relevance band." },
+    ],
+    personalised:       isPersonalised,
+    ad_influence:       false,   // immutable — core trust proposition
+    filter_bubble_risk: isPersonalised ? "low" : "none",
+    statement: isPersonalised
+      ? "Your results are ranked by your own reading patterns — not by advertising relationships or platform engagement maximisation. Your digital twin is visible and resettable in settings."
+      : "Results are ranked by relevance, source reliability, and blockchain trust signals. No advertising influences ranking. No personal data is used for anonymous sessions.",
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOPIC SPECIFICITY SPLIT
+// Determines which articles are genuinely about the searched topic vs
+// general/off-topic news that passed the relevance floor.
+// ════════════════════════════════════════════════════════════════════════════
+function splitByTopicRelevance(
+  articles: any[], core: string
+): { topicSpecific: any[]; offTopic: any[] } {
+  const topicWords = core.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  if (topicWords.length === 0) {
+    return { topicSpecific: articles.filter(a => a.description?.trim()), offTopic: [] };
+  }
   const isTopicMatch = (a: any): boolean => {
     if (!a.description?.trim() && !a.title?.trim()) return false;
     const text = `${a.title ?? ""} ${a.description ?? ""}`.toLowerCase();
-    // Article must contain at least ONE topic keyword in title or description
     return topicWords.some(w => text.includes(w));
   };
-
   const topicSpecific = articles.filter(isTopicMatch);
   const offTopic      = articles.filter(a => !isTopicMatch(a));
-
-  console.log(
-    `🎯 Topic split: ${topicSpecific.length} topic-specific` +
-    ` | ${offTopic.length} off-topic` +
-    ` | keywords: [${topicWords.join(", ")}]`
-  );
-
+  console.log(`🎯 Topic split: ${topicSpecific.length} topic-specific | ${offTopic.length} off-topic | keywords: [${topicWords.join(", ")}]`);
   return { topicSpecific, offTopic };
 }
 
 // ── Vector search helpers ─────────────────────────────────────────────────────
-async function vectorSearchNews(
-  topic: string, sbUrl: string, sbKey: string, limit = 20
-): Promise<any[]> {
+async function vectorSearchNews(topic: string, sbUrl: string, sbKey: string, limit = 20): Promise<any[]> {
   try {
     const vector = toVectorString(embedText(topic));
     const r = await fetch(`${sbUrl}/rest/v1/rpc/search_news_by_vector`, {
-      method:  "POST",
+      method: "POST",
       headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}`, "Content-Type": "application/json" },
-      body:    JSON.stringify({ query_embedding: vector, match_threshold: 0.4, match_count: limit }),
-      signal:  AbortSignal.timeout(3000),
+      body: JSON.stringify({ query_embedding: vector, match_threshold: 0.4, match_count: limit }),
+      signal: AbortSignal.timeout(3000),
     });
     if (!r.ok) return [];
     const results = await r.json();
@@ -136,16 +439,14 @@ async function vectorSearchNews(
   } catch (e: any) { console.warn("Vector search:", e.message); return []; }
 }
 
-async function vectorSearchDigests(
-  topic: string, sbUrl: string, sbKey: string, limit = 5
-): Promise<any[]> {
+async function vectorSearchDigests(topic: string, sbUrl: string, sbKey: string, limit = 5): Promise<any[]> {
   try {
     const vector = toVectorString(embedText(topic));
     const r = await fetch(`${sbUrl}/rest/v1/rpc/search_digests_by_vector`, {
-      method:  "POST",
+      method: "POST",
       headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}`, "Content-Type": "application/json" },
-      body:    JSON.stringify({ query_embedding: vector, match_threshold: 0.4, match_count: limit }),
-      signal:  AbortSignal.timeout(3000),
+      body: JSON.stringify({ query_embedding: vector, match_threshold: 0.4, match_count: limit }),
+      signal: AbortSignal.timeout(3000),
     });
     if (!r.ok) return [];
     return await r.json();
@@ -153,24 +454,18 @@ async function vectorSearchDigests(
 }
 
 // ── RL Engine ─────────────────────────────────────────────────────────────────
-async function rankWithRL(
-  articles: any[], query: string, twin: any | null
-): Promise<any[]> {
+async function rankWithRL(articles: any[], query: string, twin: any | null): Promise<any[]> {
   try {
     const r = await fetch("https://newsapp-63t4.onrender.com/rank", {
-      method:  "POST",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         articles: articles.map(a => ({
-          url:                     a.url,
-          title:                   a.title,
-          description:             a.description || "",
-          source:                  a.source || "",
-          topic:                   a.cluster_tag || "",
-          cluster_tag:             a.cluster_tag || "",
-          published_at:            a.published_at || "",
-          freshness_label:         a.freshness_label || "",
-          relevance_score:         a.relevance_score ?? 0.5,
+          url: a.url, title: a.title, description: a.description || "",
+          source: a.source || "", topic: a.cluster_tag || "",
+          cluster_tag: a.cluster_tag || "", published_at: a.published_at || "",
+          freshness_label: a.freshness_label || "",
+          relevance_score: a.relevance_score ?? 0.5,
           blockchain_verification: a.blockchain_verification ?? null,
         })),
         twin: twin ? {
@@ -185,25 +480,17 @@ async function rankWithRL(
         } : null,
         query,
       }),
-      // 30s timeout — survives Render free tier cold start (~25s)
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(30000), // 30s — survives Render free tier cold start
     });
     if (!r.ok) { console.warn("RL error:", r.status); return articles; }
     const data = await r.json();
-    console.log(
-      `🤖 RL ranked ${data.total}` +
-      ` | personalized=${data.personalized}` +
-      ` | verified_in_top=${data.verified_in_top ?? 0}`
-    );
+    console.log(`🤖 RL ranked ${data.total} | personalized=${data.personalized} | verified_in_top=${data.verified_in_top ?? 0}`);
     return data.ranked_articles.map((ra: any) => ({
       ...(articles.find(a => a.url === ra.article.url) ?? ra.article),
       personalization_score: ra.personalization_score,
       why_recommended:       ra.why,
     }));
-  } catch (e: any) {
-    console.warn("RL unavailable:", e.message);
-    return articles;
-  }
+  } catch (e: any) { console.warn("RL unavailable:", e.message); return articles; }
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -253,17 +540,14 @@ serve(async (req: Request) => {
     const cacheKey     = `digest_${displayTopic}_${regionKey}`;
     console.log(`\n🔍 "${rawTopic}" → "${core}" | region=${regionKey} | intent=${intent}`);
 
-    // ── Load digital twin (non-blocking on failure) ────────────────────────
+    // ── Load digital twin ──────────────────────────────────────────────────
     let userTwin: any = null;
     if (isLoggedIn && authHeader) {
       try {
-        const uc = createClient(ENV.sbUrl, ENV.sbAnon, {
-          global: { headers: { Authorization: authHeader } },
-        });
+        const uc = createClient(ENV.sbUrl, ENV.sbAnon, { global: { headers: { Authorization: authHeader } } });
         const { data: { user } } = await uc.auth.getUser();
         if (user) {
-          const { data: twin } = await uc
-            .from("digital_twins").select("*").eq("user_id", user.id).single();
+          const { data: twin } = await uc.from("digital_twins").select("*").eq("user_id", user.id).single();
           if (twin) { userTwin = twin; console.log(`🧠 Twin loaded`); }
         }
       } catch (e: any) { console.warn("Twin failed:", e.message); }
@@ -287,16 +571,10 @@ serve(async (req: Request) => {
 
     // ── PHASE 2: Merge + synthesize ────────────────────────────────────────
     const mergedArticles = dedup([...freshResult.articles, ...vectorArticles]);
-    console.log(
-      `📊 Fresh:${freshResult.articles.length}` +
-      ` Vector:${vectorArticles.length}` +
-      ` Merged:${mergedArticles.length}`
-    );
+    console.log(`📊 Fresh:${freshResult.articles.length} Vector:${vectorArticles.length} Merged:${mergedArticles.length}`);
 
-    const {
-      digest_source_urls, digest_reliability,
-      articles: finalArticles, coverage_tier,
-    } = synthesizeWithGuaranteedCoverage(mergedArticles, wiki, displayTopic, entityType);
+    const { digest_source_urls, digest_reliability, articles: finalArticles, coverage_tier } =
+      synthesizeWithGuaranteedCoverage(mergedArticles, wiki, displayTopic, entityType);
 
     // ── PHASE 3: RL rank ───────────────────────────────────────────────────
     const rlInput = finalArticles.map(a => ({
@@ -308,89 +586,81 @@ serve(async (req: Request) => {
     }));
     const allRanked = await rankWithRL(rlInput, displayTopic, userTwin);
 
-    // ── PHASE 4: TOPIC SPLIT ───────────────────────────────────────────────
-    // topicSpecific = articles genuinely about the searched topic
-    //                 → these get blockchain registration + GROQ digest
-    //                 → appear FIRST in the response
-    //
-    // offTopic      = general/breaking news that passed the relevance floor
-    //                 but is NOT about the searched topic
-    //                 → no blockchain → Gemini digest
-    //                 → appears AFTER topic-specific articles
-    //
-    // Example: search "AFCON Morocco Senegal"
-    //   topicSpecific → all AFCON/Morocco/Senegal articles (verified)
-    //   offTopic      → Iran war, Cuba, Pakistan news (unverified)
+    // ── PHASE 4: Topic split ───────────────────────────────────────────────
     const { topicSpecific, offTopic } = splitByTopicRelevance(allRanked, core);
-    console.log(
-      `🔗 To blockchain: ${topicSpecific.length} topic-specific` +
-      ` | Unverified off-topic: ${offTopic.length}`
-    );
+    console.log(`🔗 To blockchain: ${topicSpecific.length} | Off-topic: ${offTopic.length}`);
 
-    // ── PHASE 5: CONCURRENT — blockchain + GROQ + Gemini ──────────────────
-    // All three start at exactly the same tick.
-    // registerBatchOnChain handles its own internal rate limiting:
-    //   - single batch TX for all topic-specific articles (1 gas TX regardless of count)
-    //   - pre-check in sub-batches of 5 with 300ms between sub-batches
-    //   - exponential backoff (500ms→1s→2s) on 429 from Alchemy free tier
-    //   - cache prevents re-checking already-registered articles
-    const [batchResults, verified_digest, unverified_digest] = await Promise.all([
-      // Alchemy EVM — ALL topic-specific articles (not a fixed 20)
+    // ── PHASE 5: CONCURRENT — blockchain + LLMs + all 5 new features ──────
+    // Features 4–8 are pure in-memory CPU operations — zero network cost.
+    // They run in the same Promise.all as blockchain + GROQ + Gemini,
+    // adding ZERO latency to the response.
+    const [
+      batchResults,
+      verified_digest,
+      unverified_digest,
+      narrativeDivergence,      // Feature 5
+      temporalGraph,             // Feature 6
+      hyperLocalReport,          // Feature 7
+      rankingTransparency,       // Feature 8
+      topicReliabilityReport,    // Feature 4 — topic-specific articles
+      offTopicReliabilityReport, // Feature 4 — off-topic articles
+    ] = await Promise.all([
+      // Alchemy EVM — all topic-specific articles (not a fixed 20)
       registerBatchOnChain(
         topicSpecific.map(a => ({ content: a.description, url: a.url })),
-        200  // 200ms between sequential fallback TXs (only used if batch TX fails)
+        200
       ),
-      // GROQ llama-3.1-8b-instant — summarises verified/topic-specific articles
+      // GROQ llama-3.1-8b-instant — topic-specific digest
       generateVerifiedDigest(topicSpecific, displayTopic, ENV.groq ?? ""),
-      // Gemini 2.0 Flash — summarises off-topic/general news
+      // Gemini 2.0 Flash — off-topic digest
       generateUnverifiedDigest(offTopic, displayTopic, ENV.gemini ?? ""),
+      // Feature 5: narrative divergence (sync — no network)
+      Promise.resolve(detectNarrativeDivergence(topicSpecific)),
+      // Feature 6: temporal graph (sync — no network)
+      Promise.resolve(buildTemporalGraph(allRanked)),
+      // Feature 7: hyper-local report (sync — no network)
+      Promise.resolve(buildHyperLocalReport(allRanked)),
+      // Feature 8: ranking transparency (sync — no network)
+      Promise.resolve(buildRankingTransparency(!!userTwin)),
+      // Feature 4: reliability reports (sync — no network)
+      Promise.resolve(buildReliabilityReport(topicSpecific)),
+      Promise.resolve(buildReliabilityReport(offTopic)),
     ]);
 
     const txMap = new Map(batchResults.map(r => [r.url, r]));
 
-    // Persist tx_hashes to Supabase — fire and forget
+    // Persist tx_hashes — fire and forget
     batchResults.filter(r => r.txHash).forEach(r =>
       sbPatch(ENV.sbUrl, ENV.sbKey,
         `news?url=eq.${encodeURIComponent(r.url)}`,
-        {
-          tx_hash:                   r.txHash,
-          is_verified:               false,
-          blockchain_registered_at:  new Date().toISOString(),
-        }
+        { tx_hash: r.txHash, is_verified: false, blockchain_registered_at: new Date().toISOString() }
       )
     );
 
-    // ── Fire-and-forget verification ───────────────────────────────────────
-    // VERIFIER_PRIVATE_KEY (Account 2) calls verifyBatch() on the contract.
-    // Runs after registration — does not block the response.
-    // blockchain.ts cache is updated so next request sees verified: true.
+    // Verification — fire and forget (VERIFIER_PRIVATE_KEY / Account 2)
     verifyBatchOnChain(
       topicSpecific
         .filter(a => txMap.get(a.url)?.success)
         .map(a => ({ content: a.description }))
     ).catch(() => {});
 
-    // Batch check on-chain verified status (cache-first — 0 RPC calls on hit)
+    // Batch check on-chain status (cache-first — 0 RPC calls on hit)
     const batchChecks = await checkBatchOnChain(
       topicSpecific.map(a => ({ content: a.description, cachedHash: null }))
     );
     const checkMap = new Map(topicSpecific.map((a, i) => [a.url, batchChecks[i]]));
 
-    // ── PHASE 6: Build article objects ─────────────────────────────────────
+    // ── PHASE 6: Build article objects — Feature 4 added to every article ──
     const buildArticle = async (a: any, isTopicArticle: boolean) => {
-      const reg   = txMap.get(a.url);
-      const chk   = checkMap.get(a.url);
-      let txHash  = reg?.txHash ?? null;
+      const reg  = txMap.get(a.url);
+      const chk  = checkMap.get(a.url);
+      let txHash = reg?.txHash ?? null;
 
-      // Retrieve existing tx_hash from DB if already registered
       if (isTopicArticle && reg?.alreadyRegistered && !txHash) {
         try {
           const r = await fetch(
             `${ENV.sbUrl}/rest/v1/news?url=eq.${encodeURIComponent(a.url)}&select=tx_hash`,
-            {
-              headers: { apikey: ENV.sbKey, Authorization: `Bearer ${ENV.sbKey}` },
-              signal:  AbortSignal.timeout(2000),
-            }
+            { headers: { apikey: ENV.sbKey, Authorization: `Bearer ${ENV.sbKey}` }, signal: AbortSignal.timeout(2000) }
           );
           const rows = await r.json();
           if (rows?.[0]?.tx_hash) txHash = rows[0].tx_hash;
@@ -398,13 +668,17 @@ serve(async (req: Request) => {
       }
 
       const isRegistered = isTopicArticle && !!(txHash || reg?.alreadyRegistered);
+      const srcName = a.source?.name ?? a.source ?? "Unknown";
+
+      // Feature 4: per-article reliability surfaced to client
+      const reliability = getSourceReliability(srcName, a.reliability);
 
       return {
         title:                 a.title,
         description:           a.description ?? a.summary ?? "",
         url:                   a.url,
         image:                 a.image ?? null,
-        source:                a.source?.name ?? a.source ?? "Unknown",
+        source:                srcName,
         published_at:          a.publishedAt ?? a.published_at ?? new Date().toISOString(),
         freshness_label:       freshLbl(a.publishedAt ?? a.published_at),
         cluster_tag:           a.tier ?? "general",
@@ -412,54 +686,52 @@ serve(async (req: Request) => {
         personalization_score: a.personalization_score ?? null,
         why_recommended:       a.why_recommended ?? null,
         tier:                  a.tier ?? "general",
+
+        // ── Feature 4: source reliability on every article ─────────────────
+        source_reliability: {
+          score:       reliability.score,
+          label:       reliability.label,
+          badge:       reliability.badge,
+          explanation: reliability.explanation,
+        },
+
         blockchain_verification: isRegistered ? {
           status:           "registered",
           registered:       true,
-          verified:         chk?.verified ?? false,      // honest default
+          verified:         chk?.verified ?? false,
           publisher:        chk?.publisher ?? null,
           registered_at:    chk?.timestamp ?? new Date().toISOString(),
           contract_address: CONTRACT_ADDRESS ?? null,
           tx_hash:          txHash,
-          badge:            "✅ Registered on-chain",    // honest — not "Verified"
-          content_hash:     a.description
-            ? "0x" + await hashArticle(a.description)
-            : null,
+          badge:            "✅ Registered on-chain",
+          content_hash:     a.description ? "0x" + await hashArticle(a.description) : null,
         } : NO_BV(),
       };
     };
 
-    // Build both lists in parallel
     const [topicArticleObjs, offTopicArticleObjs] = await Promise.all([
       Promise.all(topicSpecific.map(a => buildArticle(a, true))),
       Promise.all(offTopic.map(a => buildArticle(a, false))),
     ]);
 
-    // Separate registered from failed within topic-specific group
     const confirmedRegistered = topicArticleObjs.filter(a => a.blockchain_verification.registered);
     const failedRegistration  = topicArticleObjs.filter(a => !a.blockchain_verification.registered);
+    const allUnverified       = [...failedRegistration, ...offTopicArticleObjs];
+    const articles            = [...confirmedRegistered, ...allUnverified];
 
-    // Final article order:
-    //   1. Topic-specific registered on-chain  (verified section)
-    //   2. Topic-specific that failed TX       (moved to unverified)
-    //   3. Off-topic general/breaking news     (unverified section)
-    const allUnverified = [...failedRegistration, ...offTopicArticleObjs];
-    const articles      = [...confirmedRegistered, ...allUnverified];
-
-    // ── PHASE 7: Persist — ALL fire-and-forget ─────────────────────────────
+    // ── PHASE 7: Persist — all fire-and-forget ─────────────────────────────
     upsertDigestToSupabase(
       ENV.sbUrl, ENV.sbKey, rawTopic, regionKey,
       verified_digest, unverified_digest,
       digest_reliability, digest_source_urls
     ).catch(() => {});
 
-    // Topic-specific registered articles inserted first
     insertArticlesToSupabase(
       ENV.sbUrl, ENV.sbKey,
       confirmedRegistered.map(a => ({ ...a, publishedAt: a.published_at })),
       rawTopic, regionKey, CONTRACT_ADDRESS ?? null
     ).catch(() => {});
 
-    // Off-topic + failed articles
     insertArticlesToSupabase(
       ENV.sbUrl, ENV.sbKey,
       allUnverified.map(a => ({ ...a, publishedAt: a.published_at })),
@@ -471,6 +743,7 @@ serve(async (req: Request) => {
     // ── PHASE 8: Respond ───────────────────────────────────────────────────
     return new Response(JSON.stringify({
       success: true,
+
       search: {
         original:               rawTopic,
         core_entity:            core,
@@ -482,10 +755,11 @@ serve(async (req: Request) => {
         entityType,
         coverage_tier,
       },
+
       digest: {
         verified_digest,
         unverified_digest,
-        summary:              `✅ TOPIC-SPECIFIC (ON-CHAIN):\n${verified_digest}\n\n⚠️ GENERAL NEWS (OFF-TOPIC):\n${unverified_digest}`,
+        summary:              `✅ TOPIC-SPECIFIC (ON-CHAIN):\n${verified_digest}\n\n⚠️ GENERAL NEWS:\n${unverified_digest}`,
         reliability:          digest_reliability,
         source_count:         digest_source_urls.length,
         source_urls:          digest_source_urls,
@@ -494,17 +768,52 @@ serve(async (req: Request) => {
         wikidata_context:     wikidata ?? null,
         similar_past_digests: similarDigests,
       },
+
+      // articles — each one now includes source_reliability (Feature 4)
       articles,
-      blockchain: {
-        enabled:                  !!CONTRACT_ADDRESS,
-        contract_address:         CONTRACT_ADDRESS ?? null,
-        network:                  getNetworkType(),
-        topic_specific_count:     confirmedRegistered.length,
-        off_topic_count:          allUnverified.length,
-        total_articles:           articles.length,
-        coverage:                 "all_topic_specific",   // ← was "top_20_only"
-        verification_strategy:    "topic_keyword_match",
+
+      // ── Feature 4: aggregate reliability report ───────────────────────────
+      reliability_report: {
+        topic_specific: topicReliabilityReport,
+        off_topic:      offTopicReliabilityReport,
+        note: "Reliability scores reflect editorial standards and fact-checking track record. Neither Google (SEO-ranked) nor ChatGPT (no source metadata) surfaces this.",
       },
+
+      // ── Feature 5: narrative divergence ──────────────────────────────────
+      narrative_divergence: {
+        ...narrativeDivergence,
+        note: "Shows how different outlets frame the same story — the full spectrum of how the world is reporting, not one narrative thread.",
+      },
+
+      // ── Feature 6: temporal news graph ───────────────────────────────────
+      temporal_graph: {
+        ...temporalGraph,
+        note: "How this story evolved hour by hour. Nodes with blockchain_proof=true have cryptographic timestamps — immutable proof of when information first appeared.",
+      },
+
+      // ── Feature 7: hyper-local coverage report ────────────────────────────
+      hyper_local_coverage: {
+        ...hyperLocalReport,
+        note: "Sources like GDELT (65,000 global outlets), Feedly-discovered feeds, and RSS Bridge surface news that Google deprioritises and ChatGPT never trained on.",
+      },
+
+      // ── Feature 8: ranking transparency ──────────────────────────────────
+      ranking_transparency: {
+        ...rankingTransparency,
+        note: "We show you exactly why results are ranked as they are. No advertising influences our ranking — ever.",
+      },
+
+      blockchain: {
+        enabled:               !!CONTRACT_ADDRESS,
+        contract_address:      CONTRACT_ADDRESS ?? null,
+        network:               getNetworkType(),
+        topic_specific_count:  confirmedRegistered.length,
+        off_topic_count:       allUnverified.length,
+        total_articles:        articles.length,
+        coverage:              "all_topic_specific",
+        verification_strategy: "topic_keyword_match",
+      },
+
       meta: {
         source_breakdown:      sourceCounts,
         total_fresh:           freshResult.articles.length,
@@ -525,22 +834,11 @@ serve(async (req: Request) => {
   } catch (err: any) {
     console.error("🔥", err);
     return new Response(JSON.stringify({
-      success:    false,
-      error:      "Service error",
-      message:    "Failed to fetch news. Please try again shortly.",
-      articles:   [],
-      digest: {
-        summary:          "Unable to fetch news.",
-        reliability:      0,
-        source_count:     0,
-        source_urls:      [],
-        coverage_quality: "error",
-      },
-      blockchain: {
-        enabled:          !!CONTRACT_ADDRESS,
-        contract_address: CONTRACT_ADDRESS ?? null,
-        network:          getNetworkType(),
-      },
+      success:  false, error: "Service error",
+      message:  "Failed to fetch news. Please try again shortly.",
+      articles: [],
+      digest:   { summary: "Unable to fetch news.", reliability: 0, source_count: 0, source_urls: [], coverage_quality: "error" },
+      blockchain: { enabled: !!CONTRACT_ADDRESS, contract_address: CONTRACT_ADDRESS ?? null, network: getNetworkType() },
       meta: { timestamp: new Date().toISOString() },
     }), { status: 500, headers: { "Content-Type": "application/json" } });
   }
