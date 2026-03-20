@@ -19,11 +19,11 @@ import { extractCoreEntity, embedText, toVectorString } from "./fuzzy_search.ts"
 const cache    = new Map<string, { expiry: number; data: unknown }>();
 const anonHits = new Map<string, number>();
 
-const getIP    = (req: Request) =>
+const getIP = (req: Request) =>
   req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
   req.headers.get("x-real-ip") ?? "unknown";
 
-const cached   = (k: string) => {
+const cached = (k: string) => {
   const e = cache.get(k);
   return e && e.expiry > Date.now() ? e.data : null;
 };
@@ -66,19 +66,14 @@ const sbPatch = (url: string, key: string, path: string, body: unknown) =>
 
 // ════════════════════════════════════════════════════════════════════════════
 // FEATURE 4 — SOURCE RELIABILITY SCORING
-// Surfaces the internal 3.5–4.5 reliability score as a human-readable label,
-// badge, and explanation on every article and as an aggregate report.
-// Neither Google (SEO-ranked) nor ChatGPT (no source metadata) does this.
 // ════════════════════════════════════════════════════════════════════════════
 const SOURCE_RELIABILITY_MAP: Record<string, number> = {
-  // Tier 1 — major wire services / established international press
   "Reuters": 4.8, "AP": 4.8, "AP News": 4.8,
   "BBC News": 4.7, "BBC": 4.7, "BBC World": 4.7,
   "Al Jazeera": 4.6, "Al Jazeera English": 4.6,
   "The Guardian": 4.6, "NY Times": 4.6, "NPR": 4.6,
   "France 24": 4.5, "DW News": 4.5, "Sky News": 4.5,
   "Bloomberg": 4.5, "The Economist": 4.5,
-  // Tier 2 — reputable regional / specialist press
   "ESPN": 4.3, "espn.co.uk": 4.3,
   "Sky Sports": 4.3, "Cricbuzz": 4.2,
   "Bleacher Report": 4.1, "beIN SPORTS": 4.0,
@@ -87,42 +82,31 @@ const SOURCE_RELIABILITY_MAP: Record<string, number> = {
   "The Irish Times": 4.4, "RTE": 4.3,
   "CNA": 4.3, "Channel NewsAsia": 4.3,
   "USA Today": 4.0, "New York Post": 3.7,
-  // Tier 3 — aggregators / lower verification
   "Google News": 3.5, "Yahoo Entertainment": 3.2,
   "Slashdot.org": 3.0,
 };
 
 interface ReliabilityInfo {
-  score:       number;
-  label:       string;
-  badge:       string;
-  explanation: string;
+  score: number; label: string; badge: string; explanation: string;
 }
 
 function getSourceReliability(source: string, tierReliability?: number): ReliabilityInfo {
   const knownScore = SOURCE_RELIABILITY_MAP[source];
   const score = Math.round((knownScore ?? tierReliability ?? 3.5) * 10) / 10;
-
   let label: string, badge: string, explanation: string;
-
   if (score >= 4.5) {
-    label = "very_high";
-    badge = "🏅 Very High Reliability";
+    label = "very_high"; badge = "🏅 Very High Reliability";
     explanation = `${source} is a major established outlet with strong editorial standards.`;
   } else if (score >= 4.0) {
-    label = "high";
-    badge = "✅ High Reliability";
+    label = "high"; badge = "✅ High Reliability";
     explanation = `${source} is a reputable outlet with consistent fact-checking.`;
   } else if (score >= 3.5) {
-    label = "moderate";
-    badge = "⚠️ Moderate Reliability";
+    label = "moderate"; badge = "⚠️ Moderate Reliability";
     explanation = `${source} is generally reliable — verify key claims independently.`;
   } else {
-    label = "low";
-    badge = "❓ Lower Reliability";
+    label = "low"; badge = "❓ Lower Reliability";
     explanation = `${source} is an aggregator or less-verified source — cross-check with primary outlets.`;
   }
-
   return { score, label, badge, explanation };
 }
 
@@ -153,17 +137,11 @@ function buildReliabilityReport(articles: any[]): Record<string, any> {
 
 // ════════════════════════════════════════════════════════════════════════════
 // FEATURE 5 — NARRATIVE DIVERGENCE DETECTION
-// Groups articles by HOW different outlets frame the same story.
-// "3 outlets say Morocco won. 2 say decision is controversial. 1 alleges corruption."
-// Neither Google nor ChatGPT surfaces the spectrum of how the world reports a story.
 // ════════════════════════════════════════════════════════════════════════════
 interface NarrativePerspective {
-  angle:               string;
-  framing:             string;
-  article_count:       number;
-  sources:             string[];
-  representative_title: string;
-  sentiment:           "positive" | "negative" | "neutral" | "contested";
+  angle: string; framing: string; article_count: number;
+  sources: string[]; representative_title: string;
+  sentiment: "positive" | "negative" | "neutral" | "contested";
 }
 
 const NARRATIVE_CLUSTERS: Array<{
@@ -186,18 +164,14 @@ const NARRATIVE_CLUSTERS: Array<{
 ];
 
 function detectNarrativeDivergence(articles: any[]): {
-  perspectives: NarrativePerspective[];
-  divergence_score: number;
-  summary: string;
+  perspectives: NarrativePerspective[]; divergence_score: number; summary: string;
 } {
   if (articles.length < 2) return {
     perspectives: [], divergence_score: 0,
     summary: "Not enough articles to detect narrative divergence.",
   };
-
   const matched = new Set<string>();
   const perspectives: NarrativePerspective[] = [];
-
   for (const cluster of NARRATIVE_CLUSTERS) {
     const clusterArticles = articles.filter(a => {
       if (matched.has(a.url)) return false;
@@ -214,7 +188,6 @@ function detectNarrativeDivergence(articles: any[]): {
       representative_title: best.title ?? "", sentiment: cluster.sentiment,
     });
   }
-
   const unmatched = articles.filter(a => !matched.has(a.url));
   if (unmatched.length > 0) {
     perspectives.push({
@@ -226,7 +199,6 @@ function detectNarrativeDivergence(articles: any[]): {
       sentiment: "neutral",
     });
   }
-
   perspectives.sort((a, b) => b.article_count - a.article_count);
   const uniqueSentiments = new Set(perspectives.map(p => p.sentiment)).size;
   const divergenceScore = Math.round(Math.min(1, (uniqueSentiments - 1) / 3 + (perspectives.length - 1) / 8) * 100) / 100;
@@ -235,56 +207,38 @@ function detectNarrativeDivergence(articles: any[]): {
     ? "All sources are reporting this story with a consistent angle."
     : `${perspectives.length} distinct narrative angles detected. ` +
       topTwo.map(p => `${p.article_count} source${p.article_count > 1 ? "s" : ""} frame it as "${p.angle}"`).join(". ") + ".";
-
   return { perspectives, divergence_score: divergenceScore, summary };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // FEATURE 6 — TEMPORAL NEWS GRAPH
-// Reconstructs how a story evolved hour by hour using article timestamps.
-// Nodes with blockchain TX hashes have cryptographic proof of when that
-// information first existed — something no other platform can provide.
 // ════════════════════════════════════════════════════════════════════════════
 interface TemporalNode {
-  hour_utc:        string;
-  hour_label:      string;
-  article_count:   number;
-  on_chain_count:  number;
-  sources:         string[];
-  dominant_angle:  string;
-  headlines:       string[];
-  blockchain_proof: boolean;
+  hour_utc: string; hour_label: string; article_count: number;
+  on_chain_count: number; sources: string[]; dominant_angle: string;
+  headlines: string[]; blockchain_proof: boolean;
 }
 
 function buildTemporalGraph(articles: any[]): {
-  nodes: TemporalNode[];
-  story_duration: string;
-  first_seen: string | null;
-  last_seen:  string | null;
-  peak_hour:  string | null;
+  nodes: TemporalNode[]; story_duration: string;
+  first_seen: string | null; last_seen: string | null; peak_hour: string | null;
 } {
   if (!articles.length) return { nodes: [], story_duration: "No articles", first_seen: null, last_seen: null, peak_hour: null };
-
   const withTime = articles
     .map(a => ({ ...a, _ts: new Date(a.publishedAt ?? a.published_at ?? 0).getTime() }))
-    .filter(a => a._ts > 0)
-    .sort((a, b) => a._ts - b._ts);
-
+    .filter(a => a._ts > 0).sort((a, b) => a._ts - b._ts);
   if (!withTime.length) return { nodes: [], story_duration: "No timestamps", first_seen: null, last_seen: null, peak_hour: null };
-
   const buckets = new Map<string, typeof withTime>();
   for (const a of withTime) {
-    const d    = new Date(a._ts);
+    const d = new Date(a._ts);
     const hour = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours()))
       .toISOString().replace(":00:00.000Z", ":00Z");
     if (!buckets.has(hour)) buckets.set(hour, []);
     buckets.get(hour)!.push(a);
   }
-
   const DAY_ABBR = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
   const nodes: TemporalNode[] = [];
   let peakHour = "", peakCount = 0;
-
   for (const [hour, arts] of buckets) {
     const d = new Date(hour);
     const label = `${DAY_ABBR[d.getUTCDay()]} ${String(d.getUTCHours()).padStart(2,"0")}:00 UTC`;
@@ -307,14 +261,12 @@ function buildTemporalGraph(articles: any[]): {
     });
     if (arts.length > peakCount) { peakCount = arts.length; peakHour = hour; }
   }
-
   const firstTs = withTime[0]._ts;
   const lastTs  = withTime[withTime.length - 1]._ts;
   const durationHours = Math.round((lastTs - firstTs) / 3.6e6);
   const storyDuration = durationHours <= 1 ? "Story broke and peaked within 1 hour."
     : durationHours <= 24 ? `Story unfolded over ${durationHours} hours.`
     : `Story has been developing for ${Math.round(durationHours / 24)} day(s).`;
-
   return {
     nodes, story_duration: storyDuration,
     first_seen: new Date(firstTs).toISOString(),
@@ -325,9 +277,6 @@ function buildTemporalGraph(articles: any[]): {
 
 // ════════════════════════════════════════════════════════════════════════════
 // FEATURE 7 — HYPER-LOCAL COVERAGE REPORT
-// Shows which sources your app reached that Google and ChatGPT cannot:
-// GDELT (65k global sources), Feedly-discovered feeds, RSS Bridge, DuckDuckGo.
-// Makes the coverage moat visible and measurable to users.
 // ════════════════════════════════════════════════════════════════════════════
 const HYPER_LOCAL_TIERS = new Set([
   "gdelt","discovered_feed","rss_bridge","cascade_geo",
@@ -345,7 +294,6 @@ function buildHyperLocalReport(articles: any[]): Record<string, any> {
   const tierCounts: Record<string, number> = {};
   const hyperLocalSources = new Set<string>();
   let mainStreamCount = 0;
-
   for (const a of articles) {
     const tier = a.tier ?? "unknown";
     tierCounts[tier] = (tierCounts[tier] ?? 0) + 1;
@@ -353,13 +301,11 @@ function buildHyperLocalReport(articles: any[]): Record<string, any> {
     if (HYPER_LOCAL_TIERS.has(tier) && !MAINSTREAM_SOURCES.has(src)) hyperLocalSources.add(src);
     if (MAINSTREAM_SOURCES.has(src)) mainStreamCount++;
   }
-
   const hlCount = articles.filter(a => HYPER_LOCAL_TIERS.has(a.tier ?? "")).length;
   const hlSourceList = [...hyperLocalSources].slice(0, 10);
   const advantage = hlCount === 0
     ? "All results are from mainstream sources. For this topic, major outlets provided full coverage."
     : `Found ${hlCount} article${hlCount > 1 ? "s" : ""} from ${hlSourceList.length} source${hlSourceList.length > 1 ? "s" : ""} that Google News and ChatGPT typically miss — including GDELT's global network of 65,000 outlets and independently discovered feeds.`;
-
   return {
     total_unique_sources: uniqueSources.size,
     mainstream_count:    mainStreamCount,
@@ -372,8 +318,6 @@ function buildHyperLocalReport(articles: any[]): Record<string, any> {
 
 // ════════════════════════════════════════════════════════════════════════════
 // FEATURE 8 — RANKING TRANSPARENCY REPORT
-// Shows users exactly what factors drove their results and confirms
-// zero advertising influence — the opposite of Google's model.
 // ════════════════════════════════════════════════════════════════════════════
 function buildRankingTransparency(isPersonalised: boolean): Record<string, any> {
   return {
@@ -391,7 +335,7 @@ function buildRankingTransparency(isPersonalised: boolean): Record<string, any> 
       { factor: "Freshness",               weight: "5%",  description: "More recent articles ranked slightly higher within the same relevance band." },
     ],
     personalised:       isPersonalised,
-    ad_influence:       false,   // immutable — core trust proposition
+    ad_influence:       false,
     filter_bubble_risk: isPersonalised ? "low" : "none",
     statement: isPersonalised
       ? "Your results are ranked by your own reading patterns — not by advertising relationships or platform engagement maximisation. Your digital twin is visible and resettable in settings."
@@ -401,8 +345,22 @@ function buildRankingTransparency(isPersonalised: boolean): Record<string, any> 
 
 // ════════════════════════════════════════════════════════════════════════════
 // TOPIC SPECIFICITY SPLIT
-// Determines which articles are genuinely about the searched topic vs
-// general/off-topic news that passed the relevance floor.
+//
+// ⚠️  MUST run BEFORE RL ranking (Phase 3 before Phase 4).
+//
+// WHY ORDER MATTERS:
+//   OLD (broken) order:  RL rank ALL → splitByTopicRelevance
+//   NEW (fixed) order:   splitByTopicRelevance → RL rank each group
+//
+// The old order meant which articles got blockchain-registered depended
+// on the RL engine's output. The Render free tier cold-starts the Python
+// process on every request, producing slightly different TF-IDF rankings
+// each time. This caused different articles to be verified on curl vs app
+// even for identical searches.
+//
+// This function is a pure keyword match — no network, no randomness.
+// Same query + same article pool → always same topicSpecific set.
+// RL then only controls ORDER within each group, not group membership.
 // ════════════════════════════════════════════════════════════════════════════
 function splitByTopicRelevance(
   articles: any[], core: string
@@ -418,9 +376,22 @@ function splitByTopicRelevance(
   };
   const topicSpecific = articles.filter(isTopicMatch);
   const offTopic      = articles.filter(a => !isTopicMatch(a));
-  console.log(`🎯 Topic split: ${topicSpecific.length} topic-specific | ${offTopic.length} off-topic | keywords: [${topicWords.join(", ")}]`);
+  console.log(
+    `🎯 Pre-RL split: ${topicSpecific.length} topic-specific | ` +
+    `${offTopic.length} off-topic | keywords: [${topicWords.join(", ")}]`
+  );
   return { topicSpecific, offTopic };
 }
+
+// ── Normalise an article into RL engine input shape ───────────────────────────
+// Extracted as a helper so both rankWithRL calls use identical field mapping.
+const toRLInput = (a: any) => ({
+  ...a,
+  source:          a.source?.name ?? a.source ?? "Unknown",
+  freshness_label: freshLbl(a.publishedAt ?? a.published_at ?? ""),
+  cluster_tag:     a.tier ?? "general",
+  relevance_score: a.relevance_score ?? 0.5,
+});
 
 // ── Vector search helpers ─────────────────────────────────────────────────────
 async function vectorSearchNews(topic: string, sbUrl: string, sbKey: string, limit = 20): Promise<any[]> {
@@ -455,15 +426,20 @@ async function vectorSearchDigests(topic: string, sbUrl: string, sbKey: string, 
 
 // ── RL Engine ─────────────────────────────────────────────────────────────────
 async function rankWithRL(articles: any[], query: string, twin: any | null): Promise<any[]> {
+  if (!articles.length) return articles;
   try {
     const r = await fetch("https://newsapp-63t4.onrender.com/rank", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         articles: articles.map(a => ({
-          url: a.url, title: a.title, description: a.description || "",
-          source: a.source || "", topic: a.cluster_tag || "",
-          cluster_tag: a.cluster_tag || "", published_at: a.published_at || "",
+          url:             a.url,
+          title:           a.title,
+          description:     a.description || "",
+          source:          a.source || "",
+          topic:           a.cluster_tag || "",
+          cluster_tag:     a.cluster_tag || "",
+          published_at:    a.published_at || "",
           freshness_label: a.freshness_label || "",
           relevance_score: a.relevance_score ?? 0.5,
           blockchain_verification: a.blockchain_verification ?? null,
@@ -480,7 +456,7 @@ async function rankWithRL(articles: any[], query: string, twin: any | null): Pro
         } : null,
         query,
       }),
-      signal: AbortSignal.timeout(30000), // 30s — survives Render free tier cold start
+      signal: AbortSignal.timeout(30000), // survives Render free-tier cold start
     });
     if (!r.ok) { console.warn("RL error:", r.status); return articles; }
     const data = await r.json();
@@ -576,53 +552,60 @@ serve(async (req: Request) => {
     const { digest_source_urls, digest_reliability, articles: finalArticles, coverage_tier } =
       synthesizeWithGuaranteedCoverage(mergedArticles, wiki, displayTopic, entityType);
 
-    // ── PHASE 3: RL rank ───────────────────────────────────────────────────
-    const rlInput = finalArticles.map(a => ({
-      ...a,
-      source:          a.source?.name ?? a.source ?? "Unknown",
-      freshness_label: freshLbl(a.publishedAt),
-      cluster_tag:     a.tier ?? "general",
-      relevance_score: a.relevance_score ?? 0.5,
-    }));
-    const allRanked = await rankWithRL(rlInput, displayTopic, userTwin);
+    // ════════════════════════════════════════════════════════════════════════
+    // PHASE 3: TOPIC SPLIT — deterministic keyword match, runs BEFORE RL
+    //
+    // This is the key fix for the curl-vs-app discrepancy.
+    // splitByTopicRelevance is a pure string operation: same articles +
+    // same core → always the same topicSpecific set, regardless of which
+    // Render instance serves the request or how warm it is.
+    // ════════════════════════════════════════════════════════════════════════
+    const { topicSpecific: rawTopicSpecific, offTopic: rawOffTopic } =
+      splitByTopicRelevance(finalArticles, core);
 
-    // ── PHASE 4: Topic split ───────────────────────────────────────────────
-    const { topicSpecific, offTopic } = splitByTopicRelevance(allRanked, core);
-    console.log(`🔗 To blockchain: ${topicSpecific.length} | Off-topic: ${offTopic.length}`);
+    // ════════════════════════════════════════════════════════════════════════
+    // PHASE 4: RL ranks WITHIN each group separately
+    //
+    // Two parallel RL calls — one per group.
+    // RL controls ORDER within each group, not which group an article
+    // belongs to. Cold-start ranking variance no longer affects which
+    // articles get blockchain-registered.
+    // ════════════════════════════════════════════════════════════════════════
+    const [topicSpecific, offTopic] = await Promise.all([
+      rankWithRL(rawTopicSpecific.map(toRLInput), displayTopic, userTwin),
+      rankWithRL(rawOffTopic.map(toRLInput),      displayTopic, userTwin),
+    ]);
 
-    // ── PHASE 5: CONCURRENT — blockchain + LLMs + all 5 new features ──────
-    // Features 4–8 are pure in-memory CPU operations — zero network cost.
+    console.log(`🔗 To blockchain: ${topicSpecific.length} topic-specific | Off-topic: ${offTopic.length}`);
+
+    // Combined list for features that need the full article pool
+    const allRanked = [...topicSpecific, ...offTopic];
+
+    // ── PHASE 5: CONCURRENT — blockchain + LLMs + features 4–8 ───────────
+    // Features 4–8 are pure in-memory CPU — zero network cost.
     // They run in the same Promise.all as blockchain + GROQ + Gemini,
     // adding ZERO latency to the response.
     const [
       batchResults,
       verified_digest,
       unverified_digest,
-      narrativeDivergence,      // Feature 5
-      temporalGraph,             // Feature 6
-      hyperLocalReport,          // Feature 7
-      rankingTransparency,       // Feature 8
-      topicReliabilityReport,    // Feature 4 — topic-specific articles
-      offTopicReliabilityReport, // Feature 4 — off-topic articles
+      narrativeDivergence,
+      temporalGraph,
+      hyperLocalReport,
+      rankingTransparency,
+      topicReliabilityReport,
+      offTopicReliabilityReport,
     ] = await Promise.all([
-      // Alchemy EVM — all topic-specific articles (not a fixed 20)
       registerBatchOnChain(
         topicSpecific.map(a => ({ content: a.description, url: a.url })),
         200
       ),
-      // GROQ llama-3.1-8b-instant — topic-specific digest
       generateVerifiedDigest(topicSpecific, displayTopic, ENV.groq ?? ""),
-      // Gemini 2.0 Flash — off-topic digest
       generateUnverifiedDigest(offTopic, displayTopic, ENV.gemini ?? ""),
-      // Feature 5: narrative divergence (sync — no network)
       Promise.resolve(detectNarrativeDivergence(topicSpecific)),
-      // Feature 6: temporal graph (sync — no network)
       Promise.resolve(buildTemporalGraph(allRanked)),
-      // Feature 7: hyper-local report (sync — no network)
       Promise.resolve(buildHyperLocalReport(allRanked)),
-      // Feature 8: ranking transparency (sync — no network)
       Promise.resolve(buildRankingTransparency(!!userTwin)),
-      // Feature 4: reliability reports (sync — no network)
       Promise.resolve(buildReliabilityReport(topicSpecific)),
       Promise.resolve(buildReliabilityReport(offTopic)),
     ]);
@@ -644,13 +627,13 @@ serve(async (req: Request) => {
         .map(a => ({ content: a.description }))
     ).catch(() => {});
 
-    // Batch check on-chain status (cache-first — 0 RPC calls on hit)
+    // Batch check on-chain status
     const batchChecks = await checkBatchOnChain(
       topicSpecific.map(a => ({ content: a.description, cachedHash: null }))
     );
     const checkMap = new Map(topicSpecific.map((a, i) => [a.url, batchChecks[i]]));
 
-    // ── PHASE 6: Build article objects — Feature 4 added to every article ──
+    // ── PHASE 6: Build article objects ─────────────────────────────────────
     const buildArticle = async (a: any, isTopicArticle: boolean) => {
       const reg  = txMap.get(a.url);
       const chk  = checkMap.get(a.url);
@@ -668,10 +651,8 @@ serve(async (req: Request) => {
       }
 
       const isRegistered = isTopicArticle && !!(txHash || reg?.alreadyRegistered);
-      const srcName = a.source?.name ?? a.source ?? "Unknown";
-
-      // Feature 4: per-article reliability surfaced to client
-      const reliability = getSourceReliability(srcName, a.reliability);
+      const srcName      = a.source?.name ?? a.source ?? "Unknown";
+      const reliability  = getSourceReliability(srcName, a.reliability);
 
       return {
         title:                 a.title,
@@ -680,21 +661,18 @@ serve(async (req: Request) => {
         image:                 a.image ?? null,
         source:                srcName,
         published_at:          a.publishedAt ?? a.published_at ?? new Date().toISOString(),
-        freshness_label:       freshLbl(a.publishedAt ?? a.published_at),
+        freshness_label:       freshLbl(a.publishedAt ?? a.published_at ?? ""),
         cluster_tag:           a.tier ?? "general",
         relevance_score:       a.relevance_score ?? 0.85,
         personalization_score: a.personalization_score ?? null,
         why_recommended:       a.why_recommended ?? null,
         tier:                  a.tier ?? "general",
-
-        // ── Feature 4: source reliability on every article ─────────────────
         source_reliability: {
           score:       reliability.score,
           label:       reliability.label,
           badge:       reliability.badge,
           explanation: reliability.explanation,
         },
-
         blockchain_verification: isRegistered ? {
           status:           "registered",
           registered:       true,
@@ -769,35 +747,29 @@ serve(async (req: Request) => {
         similar_past_digests: similarDigests,
       },
 
-      // articles — each one now includes source_reliability (Feature 4)
       articles,
 
-      // ── Feature 4: aggregate reliability report ───────────────────────────
       reliability_report: {
         topic_specific: topicReliabilityReport,
         off_topic:      offTopicReliabilityReport,
         note: "Reliability scores reflect editorial standards and fact-checking track record. Neither Google (SEO-ranked) nor ChatGPT (no source metadata) surfaces this.",
       },
 
-      // ── Feature 5: narrative divergence ──────────────────────────────────
       narrative_divergence: {
         ...narrativeDivergence,
         note: "Shows how different outlets frame the same story — the full spectrum of how the world is reporting, not one narrative thread.",
       },
 
-      // ── Feature 6: temporal news graph ───────────────────────────────────
       temporal_graph: {
         ...temporalGraph,
         note: "How this story evolved hour by hour. Nodes with blockchain_proof=true have cryptographic timestamps — immutable proof of when information first appeared.",
       },
 
-      // ── Feature 7: hyper-local coverage report ────────────────────────────
       hyper_local_coverage: {
         ...hyperLocalReport,
         note: "Sources like GDELT (65,000 global outlets), Feedly-discovered feeds, and RSS Bridge surface news that Google deprioritises and ChatGPT never trained on.",
       },
 
-      // ── Feature 8: ranking transparency ──────────────────────────────────
       ranking_transparency: {
         ...rankingTransparency,
         note: "We show you exactly why results are ranked as they are. No advertising influences our ranking — ever.",
@@ -811,7 +783,8 @@ serve(async (req: Request) => {
         off_topic_count:       allUnverified.length,
         total_articles:        articles.length,
         coverage:              "all_topic_specific",
-        verification_strategy: "topic_keyword_match",
+        // Updated strategy label — confirms pre-RL split is active
+        verification_strategy: "topic_keyword_match_pre_rl",
       },
 
       meta: {
