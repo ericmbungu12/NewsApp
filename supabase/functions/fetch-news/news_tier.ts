@@ -22,10 +22,14 @@ const sbH   = (k:string)=>({"apikey":k,"Authorization":`Bearer ${k}`,"Content-Ty
 // Minimum articles before cascade fires
 const CASCADE_MIN = 5;
 
+// ── regionMap typed as Record<string, string[]> for safe .includes() calls ───
+const typedRegionMap = regionMap as Record<string, string[]>;
+
 // ── Detect ISO from topic ──────────────────────────────────────────────────
 function detectCountry(topic:string):string|null{
   const t=topic.toLowerCase();
-  for(const[name,iso]of Object.entries(NAME_ISO).sort((a,b)=>b[0].length-a[0].length))
+  // Cast NAME_ISO entries so [name, iso] are both string — fixes error 1
+  for(const[name,iso] of (Object.entries(NAME_ISO) as [string,string][]).sort((a,b)=>b[0].length-a[0].length))
     if(new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}\\b`,"i").test(t))return iso;
   return null;
 }
@@ -45,12 +49,6 @@ function parseXML(xml:string,src:string,tier="rss",reliability=3.8):any[]{
 
 // ════════════════════════════════════════════════════════════════════════════
 // UNIVERSAL CASCADE — geographic + language ladder
-// Works for any topic, any location, any language on earth.
-// Level 2–5: geographic expansion (country → sub-region → continent → global)
-// Level 6:   local language query
-// Level 7:   GDELT 72h hyper-local
-// Level 8:   RSS Bridge DuckDuckGo
-// Level 9:   Feedly feed discovery
 // ════════════════════════════════════════════════════════════════════════════
 
 function getGeographicLadder(topic:string, regionKey:string): string[] {
@@ -73,8 +71,9 @@ function getGeographicLadder(topic:string, regionKey:string): string[] {
       caribbean:"caribbean", oceania:"pacific",
       northamerica:"north america", southamerica:"south america",
     };
-    for (const [region, codes] of Object.entries(regionMap)) {
-      if (codes.includes(iso) && subRegionMap[region]) {
+    // Cast codes as string[] — fixes error 2
+    for (const [region, codes] of Object.entries(typedRegionMap)) {
+      if ((codes as string[]).includes(iso) && subRegionMap[region]) {
         ladder.push(`${subRegionMap[region]} ${core}`);
         break;
       }
@@ -89,8 +88,9 @@ function getGeographicLadder(topic:string, regionKey:string): string[] {
       southamerica:"south america", caribbean:"caribbean",
       oceania:"oceania",
     };
-    for (const [region, codes] of Object.entries(regionMap)) {
-      if (codes.includes(iso) && continentMap[region]) {
+    // Cast codes as string[] — fixes error 3
+    for (const [region, codes] of Object.entries(typedRegionMap)) {
+      if ((codes as string[]).includes(iso) && continentMap[region]) {
         ladder.push(`${continentMap[region]} ${core}`);
         break;
       }
@@ -345,7 +345,9 @@ async function rssAggregators(topic:string,regionKey:string):Promise<any[]>{
   const core=extractCoreEntity(topic);
   const isos=[...new Set([...getISOsForRegion(regionKey),...(detectCountry(topic)?[detectCountry(topic)!]:[])])];
   const groups=new Set<string>(["global"]);
-  for(const[g,codes]of Object.entries(regionMap))if(codes.some(c=>isos.includes(c))&&AGG[g])groups.add(g);
+  // Cast codes as string[] — fixes error in rssAggregators (image 3)
+  for(const[g,codes] of Object.entries(typedRegionMap))
+    if((codes as string[]).some(c=>isos.includes(c))&&AGG[g])groups.add(g);
   const raw=dedup((await Promise.allSettled([...groups].map(async g=>{const{url,name}=AGG[g];try{const r=await fw(url,3000);if(!r.ok)return[];return parseXML(await r.text(),name,"regional_agg",3.8);}catch{return[];}})))
     .flatMap(r=>r.status==="fulfilled"?r.value:[]));
   const d=filterAndRank(core,raw,0.10);console.log(`✅ Aggregators: ${d.length}/${raw.length}`);return d;
@@ -370,7 +372,6 @@ async function rssBridge(topic:string):Promise<any[]>{
   const d=filterAndRank(core,raw,0.10);console.log(`✅ RSS Bridge: ${d.length}`);return d;
 }
 
-// 72h window + multiple query variants
 async function rssGDELT(topic:string,regionKey:string):Promise<any[]>{
   const core=extractCoreEntity(topic);
   const iso=detectCountry(topic)??getISOsForRegion(regionKey)[0]??"US";
@@ -398,7 +399,6 @@ async function rssGDELT(topic:string,regionKey:string):Promise<any[]>{
   const d=filterAndRank(core,raw,0.10);console.log(`✅ GDELT: ${d.length}`);return d;
 }
 
-// Topic-specific via Google News site: operator
 async function rssLive(topic:string,isSport=false):Promise<any[]>{
   const core    =extractCoreEntity(topic);
   const variants=expandQueryVariants(core).slice(0,2);
@@ -435,7 +435,6 @@ async function rssLive(topic:string,isSport=false):Promise<any[]>{
   const d=filterAndRank(core,raw,0.10);console.log(`✅ Live: ${d.length}`);return d;
 }
 
-// 3 query variants
 async function rssWebSearch(topic:string):Promise<any[]>{
   const core=extractCoreEntity(topic);
   const variants=[`${core} news`,`${core} latest 2026`,`${core} today`];
@@ -490,27 +489,19 @@ export function detectEntityType(q:string,ct:string):string{
 
 // ════════════════════════════════════════════════════════════════════════════
 // UNIVERSAL QUERY EXPANSION
-// Works for any topic on earth — no predefined categories needed.
-// Generates expansions purely from the words in the query itself.
 // ════════════════════════════════════════════════════════════════════════════
 export function expandQueryForCoverage(
   raw: string,
   regionKey: string,
-  _entityType: string  // kept for signature compatibility — no longer gates expansions
+  _entityType: string
 ): string[] {
   const core = extractCoreEntity(raw);
   const base = raw.toLowerCase();
 
-  // 1. Base variants
   const baseVariants = expandQueryVariants(core).slice(0, 3);
-
-  // 2. Geographic ladder — works for any location
   const geoLadder = getGeographicLadder(raw, regionKey);
-
-  // 3. Local language
   const localLang = getLocalLanguageQueries(raw);
 
-  // 4. Universal recency modifiers — work for ANY topic
   const recency = [
     `${core} latest`,
     `${core} today`,
@@ -519,17 +510,9 @@ export function expandQueryForCoverage(
     `${core} update`,
   ];
 
-  // 5. Universal word-based context variants
-  // Works for ANY topic: "coffee Ethiopia", "anime Japan", "Maori culture",
-  // "quantum computing", "Amazonian deforestation", "jazz New Orleans" etc.
-  const words = core
-    .split(" ")
-    .filter(w => w.length > 2)
-    .map(w => w.toLowerCase());
-
+  const words = core.split(" ").filter(w => w.length > 2).map(w => w.toLowerCase());
   const contextVariants: string[] = [];
 
-  // Reverse word order — "coffee Ethiopia" → "Ethiopia coffee"
   if (words.length >= 2) {
     const reversed = [...words].reverse().join(" ");
     if (reversed !== core.toLowerCase()) {
@@ -539,18 +522,14 @@ export function expandQueryForCoverage(
     }
   }
 
-  // Each individual word + "news" — catches single-concept searches
-  // "quantum computing" → "quantum news", "computing news"
   if (words.length >= 2) {
     for (const w of words) {
       if (w.length > 3) contextVariants.push(`${w} news`);
     }
   }
 
-  // 6. Year + month
   const withYear = [`${core} 2026`, `${core} March 2026`];
 
-  // 7. Region-scoped if not already in query
   if (regionKey && regionKey !== "global") {
     const regionName = regionKey.replace(/_/g, " ");
     if (!base.includes(regionName)) {
@@ -669,7 +648,7 @@ export async function fetchTier9NewsData(topic:string,regionKey:string,apiKey?:s
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// MASTER PIPELINE — with cascade + universal expansion
+// MASTER PIPELINE
 // ════════════════════════════════════════════════════════════════════════════
 export async function fetchAllSources(
   topic:string,regionKey:string,queries:string[],
@@ -715,9 +694,6 @@ export async function fetchAllSources(
 
   let allArticles=filterAndRank(core,merged,0.08);
 
-  // Universal cascade — fires only when parallel sources returned scarce results.
-  // Climbs the geographic and language ladder to find relevant content for
-  // any topic anywhere on earth — never falls back to unrelated news.
   if(allArticles.length<CASCADE_MIN){
     console.log(`⚠️ Only ${allArticles.length} results — triggering cascade...`);
     const cascadeResults=await cascadeSearch(topic,regionKey,allArticles.length);
@@ -752,7 +728,7 @@ export function synthesizeWithGuaranteedCoverage(allArticles:any[],wiki:any,clea
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// LLM DIGEST — GROQ (verified) + Gemini 2.0 Flash (unverified) — concurrent
+// LLM DIGEST
 // ════════════════════════════════════════════════════════════════════════════
 const fmtArticles=(arts:any[],max=8)=>
   arts.slice(0,max).map((a,i)=>`${i+1}. [${a.source?.name??a.source??"Unknown"}] ${a.title}`).join("\n");

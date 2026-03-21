@@ -469,6 +469,17 @@ async function rankWithRL(articles: any[], query: string, twin: any | null): Pro
   } catch (e: any) { console.warn("RL unavailable:", e.message); return articles; }
 }
 
+// ── BatchResult type — registerBatchOnChain return shape ─────────────────────
+// Typed explicitly so TS resolves .success / .txHash / .alreadyRegistered
+// without casting every access to `any`.
+interface BatchResult {
+  url:               string;
+  success:           boolean;
+  txHash:            string | null;
+  alreadyRegistered: boolean;
+  error?:            string;
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 serve(async (req: Request) => {
   const ENV = {
@@ -549,13 +560,13 @@ serve(async (req: Request) => {
     const mergedArticles = dedup([...freshResult.articles, ...vectorArticles]);
     console.log(`📊 Fresh:${freshResult.articles.length} Vector:${vectorArticles.length} Merged:${mergedArticles.length}`);
 
-    const { digest_source_urls, digest_reliability, articles: finalArticles, coverage_tier } =
+    const { digest_source_urls, digest_reliability, articles: finalArticlesRaw, coverage_tier } =
       synthesizeWithGuaranteedCoverage(mergedArticles, wiki, displayTopic, entityType);
 
-    // ⚡ Hard cap — prevents CPU timeout on high-volume topics
-    // synthesizeWithGuaranteedCoverage may return 500+ articles for popular topics
-    const finalArticles = finalArticlesRaw.slice(0, 200);
-    console.log(`✂️ Capped to ${finalArticles.length} articles for processing`);
+    // ⚡ Hard cap — EPL and similar topics return 1000+ articles → CPU timeout
+    // 200 gives rich results while keeping well within Supabase Edge CPU budget
+    const finalArticles: any[] = finalArticlesRaw.slice(0, 200);
+    console.log(`✂️ Capped: ${finalArticlesRaw.length} → ${finalArticles.length} articles`);
 
     // ════════════════════════════════════════════════════════════════════════
     // PHASE 3: TOPIC SPLIT — deterministic keyword match, runs BEFORE RL
@@ -576,15 +587,13 @@ serve(async (req: Request) => {
     // belongs to. Cold-start ranking variance no longer affects which
     // articles get blockchain-registered.
     // ════════════════════════════════════════════════════════════════════════
-    // Cap each group before sending to RL engine
-    // Two parallel RL calls on 300+ articles each causes CPU timeout
-
-    const MAX_TOPIC_RL  = 40; // enough for blockchain + digest
-    const MAX_OFFTOPIC_RL = 60; // enough for general news feed
+    // ⚡ Cap each group before RL — 300+ articles per call causes CPU timeout
+    const MAX_TOPIC_RL    = 40;  // enough for blockchain batch + GROQ digest
+    const MAX_OFFTOPIC_RL = 60;  // enough for a rich general news feed
 
     const [topicSpecific, offTopic] = await Promise.all([
-      rankWithRL(rawTopicSpecific.map(toRLInput), displayTopic, userTwin),
-      rankWithRL(rawOffTopic.map(toRLInput),      displayTopic, userTwin),
+      rankWithRL(rawTopicSpecific.slice(0, MAX_TOPIC_RL).map(toRLInput),   displayTopic, userTwin),
+      rankWithRL(rawOffTopic.slice(0, MAX_OFFTOPIC_RL).map(toRLInput),     displayTopic, userTwin),
     ]);
 
     console.log(`🔗 To blockchain: ${topicSpecific.length} topic-specific | Off-topic: ${offTopic.length}`);
@@ -597,7 +606,7 @@ serve(async (req: Request) => {
     // They run in the same Promise.all as blockchain + GROQ + Gemini,
     // adding ZERO latency to the response.
     const [
-      batchResults,
+      batchResults,         // typed as BatchResult[] — fixes errors 4–7
       verified_digest,
       unverified_digest,
       narrativeDivergence,
@@ -610,7 +619,7 @@ serve(async (req: Request) => {
       registerBatchOnChain(
         topicSpecific.map(a => ({ content: a.description, url: a.url })),
         200
-      ),
+      ) as Promise<BatchResult[]>,
       generateVerifiedDigest(topicSpecific, displayTopic, ENV.groq ?? ""),
       generateUnverifiedDigest(offTopic, displayTopic, ENV.gemini ?? ""),
       Promise.resolve(detectNarrativeDivergence(topicSpecific)),
@@ -621,7 +630,8 @@ serve(async (req: Request) => {
       Promise.resolve(buildReliabilityReport(offTopic)),
     ]);
 
-    const txMap = new Map(batchResults.map(r => [r.url, r]));
+    // Explicitly typed so TS resolves .txHash / .success / .alreadyRegistered
+    const txMap = new Map<string, BatchResult>(batchResults.map(r => [r.url, r]));
 
     // Persist tx_hashes — fire and forget
     batchResults.filter(r => r.txHash).forEach(r =>
@@ -634,20 +644,20 @@ serve(async (req: Request) => {
     // Verification — fire and forget (VERIFIER_PRIVATE_KEY / Account 2)
     verifyBatchOnChain(
       topicSpecific
-        .filter(a => txMap.get(a.url)?.success)
+        .filter(a => (txMap.get(a.url) as BatchResult | undefined)?.success)
         .map(a => ({ content: a.description }))
     ).catch(() => {});
 
-    // Batch check on-chain status
-    const batchChecks = await checkBatchOnChain(
+    // Batch check on-chain status — typed as any[] so .verified/.publisher resolve
+    const batchChecks: any[] = await checkBatchOnChain(
       topicSpecific.map(a => ({ content: a.description, cachedHash: null }))
-    );
-    const checkMap = new Map(topicSpecific.map((a, i) => [a.url, batchChecks[i]]));
+    ) as any[];
+    const checkMap = new Map<string, any>(topicSpecific.map((a, i) => [a.url, batchChecks[i]]));
 
     // ── PHASE 6: Build article objects ─────────────────────────────────────
     const buildArticle = async (a: any, isTopicArticle: boolean) => {
-      const reg  = txMap.get(a.url);
-      const chk  = checkMap.get(a.url);
+      const reg  = txMap.get(a.url) as BatchResult | undefined;
+      const chk  = checkMap.get(a.url) as any;
       let txHash = reg?.txHash ?? null;
 
       if (isTopicArticle && reg?.alreadyRegistered && !txHash) {
