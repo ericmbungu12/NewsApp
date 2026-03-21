@@ -552,6 +552,11 @@ serve(async (req: Request) => {
     const { digest_source_urls, digest_reliability, articles: finalArticles, coverage_tier } =
       synthesizeWithGuaranteedCoverage(mergedArticles, wiki, displayTopic, entityType);
 
+    // ⚡ Hard cap — prevents CPU timeout on high-volume topics
+    // synthesizeWithGuaranteedCoverage may return 500+ articles for popular topics
+    const finalArticles = finalArticlesRaw.slice(0, 200);
+    console.log(`✂️ Capped to ${finalArticles.length} articles for processing`);
+
     // ════════════════════════════════════════════════════════════════════════
     // PHASE 3: TOPIC SPLIT — deterministic keyword match, runs BEFORE RL
     //
@@ -571,6 +576,12 @@ serve(async (req: Request) => {
     // belongs to. Cold-start ranking variance no longer affects which
     // articles get blockchain-registered.
     // ════════════════════════════════════════════════════════════════════════
+    // Cap each group before sending to RL engine
+    // Two parallel RL calls on 300+ articles each causes CPU timeout
+
+    const MAX_TOPIC_RL  = 40; // enough for blockchain + digest
+    const MAX_OFFTOPIC_RL = 60; // enough for general news feed
+
     const [topicSpecific, offTopic] = await Promise.all([
       rankWithRL(rawTopicSpecific.map(toRLInput), displayTopic, userTwin),
       rankWithRL(rawOffTopic.map(toRLInput),      displayTopic, userTwin),
